@@ -1,0 +1,33 @@
+[package]
+name = "dir-tree"
+version = "0.1.0"
+edition = "2021"
+description = "A tree-based TUI to replace cd & ls — toggle on/off in your shell, navigate with mouse or keys"
+
+[dependencies]
+# ── TUI framework ──────────────────────────────────────────────
+ratatui  = { version = "0.30", features = ["crossterm"] }
+crossterm = "0.29"
+
+# ── Async / event loop ────────────────────────────────────────
+tokio = { version = "1", features = ["full"] }
+
+# ── Filesystem helpers ────────────────────────────────────────
+ignore   = "0.4"          # respects .gitignore while walking
+walkdir  = "2"            # recursive directory walking
+
+# ── Data & error handling ─────────────────────────────────────
+anyhow   = "1"
+thiserror = "2"
+
+# ── CLI argument parsing ──────────────────────────────────────
+clap = { version = "4", features = ["derive"] }
+
+# ── Logging (debug builds) ────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

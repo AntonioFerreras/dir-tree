@@ -50,6 +50,10 @@ pub struct AppState {
     pub dir_sizes: HashMap<PathBuf, u64>,
     /// Computed file sizes (path → bytes). Populated asynchronously.
     pub file_sizes: HashMap<PathBuf, u64>,
+    /// Cached per-directory `local_sum` from workers (direct files + recursive
+    /// walks of non-tree child dirs).  Survives across recomputes so that only
+    /// directories whose tree-children changed need re-walking.
+    pub dir_local_sums: HashMap<PathBuf, u64>,
     /// Flag set by event handlers to trigger a background size recomputation.
     pub needs_size_recompute: bool,
     /// Monotonic generation id used to ignore stale background size updates.
@@ -71,6 +75,7 @@ impl AppState {
             settings_selected: 0,
             dir_sizes: HashMap::new(),
             file_sizes: HashMap::new(),
+            dir_local_sums: HashMap::new(),
             needs_size_recompute: false,
             size_compute_generation: 0,
         }

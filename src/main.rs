@@ -10,7 +10,8 @@ mod ui;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, stderr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,8 +64,6 @@ struct Cli {
 
 // ───────────────────────────────────────── size computation ──
 
-const STAT_CHUNK_SIZE: usize = 256;
-
 #[derive(Debug)]
 enum SizeUpdate {
     File { path: PathBuf, size: u64 },
@@ -72,12 +71,15 @@ enum SizeUpdate {
     WorkerDone,
 }
 
-#[derive(Clone)]
-struct DirStatJob {
-    dir: PathBuf,
-    files: Arc<Vec<PathBuf>>,
-    cursor: usize,
-    local_sum: u64,
+/// Shared read-only context available to every worker thread.
+struct WorkerCtx {
+    /// Paths of directories that are nodes in the display tree.
+    /// Workers skip these during their walk because the cascade
+    /// handles them separately.
+    tree_dirs: HashSet<PathBuf>,
+    /// Snapshot of already-known file sizes (avoids redundant `stat` calls
+    /// on recompute after expand).
+    known_file_sizes: HashMap<PathBuf, u64>,
 }
 
 struct SizeComputeState {
@@ -89,6 +91,8 @@ struct SizeComputeState {
     children_sum: HashMap<PathBuf, u64>,
     local_done: HashMap<PathBuf, u64>,
     finished: HashSet<PathBuf>,
+    /// Shared flag used to signal worker threads to stop early.
+    cancel: Arc<AtomicBool>,
 }
 
 fn start_size_computation(
@@ -98,16 +102,29 @@ fn start_size_computation(
     state.size_compute_generation = state.size_compute_generation.wrapping_add(1);
     let generation = state.size_compute_generation;
 
-    // Recompute from scratch for the currently-loaded tree snapshot.
+    // Clear dir sizes (tree structure may have changed, so totals need
+    // recomputation), but KEEP file sizes — individual file sizes remain
+    // valid across expand/collapse and avoid expensive re-stat calls.
     state.dir_sizes.clear();
-    state.file_sizes.clear();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Build a set of all directory paths that are nodes in the display tree.
+    // Workers use this to know which child dirs the cascade already handles
+    // vs which ones need an inline recursive walk.
+    let mut tree_dirs = HashSet::new();
+    for node in &state.tree.nodes {
+        if node.meta.is_dir {
+            tree_dirs.insert(node.meta.path.clone());
+        }
+    }
 
     let mut dirs = Vec::new();
     let mut parent_dir: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let mut pending_children: HashMap<PathBuf, usize> = HashMap::new();
     let mut children_sum: HashMap<PathBuf, u64> = HashMap::new();
     let mut local_done: HashMap<PathBuf, u64> = HashMap::new();
-    let mut jobs = VecDeque::new();
+    let mut jobs: VecDeque<PathBuf> = VecDeque::new();
 
     for node in &state.tree.nodes {
         if !node.meta.is_dir {
@@ -127,33 +144,34 @@ fn start_size_computation(
         });
         parent_dir.insert(dir_path.clone(), parent_path);
 
-        let mut child_dir_count = 0usize;
-        let mut files = Vec::new();
-        for &child_id in &node.children {
-            let child = &state.tree.nodes[child_id];
-            if child.meta.is_dir {
-                child_dir_count += 1;
-            } else {
-                files.push(child.meta.path.clone());
-            }
-        }
+        // Count only tree-loaded child directories for the cascade;
+        // non-tree child dirs are walked inline by the worker and
+        // included in local_sum.
+        let child_dir_count = node
+            .children
+            .iter()
+            .filter(|&&cid| state.tree.nodes[cid].meta.is_dir)
+            .count();
 
         pending_children.insert(dir_path.clone(), child_dir_count);
         children_sum.insert(dir_path.clone(), 0);
 
-        if files.is_empty() {
-            local_done.insert(dir_path.clone(), 0);
+        // If we already have a cached local_sum for this directory, reuse it
+        // instead of spawning a worker job.  The cache is invalidated only for
+        // directories whose tree-children changed (i.e. the expanded dir).
+        if let Some(&cached) = state.dir_local_sums.get(&dir_path) {
+            local_done.insert(dir_path, cached);
         } else {
-            jobs.push_back(DirStatJob {
-                dir: dir_path,
-                files: Arc::new(files),
-                cursor: 0,
-                local_sum: 0,
-            });
+            jobs.push_back(dir_path);
         }
     }
 
     let queue = Arc::new(Mutex::new(jobs));
+    let ctx = Arc::new(WorkerCtx {
+        tree_dirs,
+        known_file_sizes: state.file_sizes.clone(),
+    });
+
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -166,49 +184,89 @@ fn start_size_computation(
         for _ in 0..worker_count {
             let queue = Arc::clone(&queue);
             let tx = tx.clone();
+            let cancel = Arc::clone(&cancel);
+            let ctx = Arc::clone(&ctx);
             std::thread::spawn(move || {
                 loop {
-                    let mut job = {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let dir = {
                         let mut q = match queue.lock() {
                             Ok(guard) => guard,
                             Err(_) => break,
                         };
                         match q.pop_front() {
-                            Some(job) => job,
+                            Some(d) => d,
                             None => break,
                         }
                     };
 
-                    let mut processed = 0usize;
-                    while processed < STAT_CHUNK_SIZE && job.cursor < job.files.len() {
-                        let path = job.files[job.cursor].clone();
-                        job.cursor += 1;
-                        processed += 1;
-
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if meta.is_file() {
-                                let size = meta.len();
-                                job.local_sum = job.local_sum.saturating_add(size);
-                                let _ = tx.send((generation, SizeUpdate::File { path, size }));
-                            }
+                    // Walk the REAL filesystem at depth 1 for this directory.
+                    let entries = match std::fs::read_dir(&dir) {
+                        Ok(e) => e,
+                        Err(_) => {
+                            let _ = tx.send((
+                                generation,
+                                SizeUpdate::DirLocalDone {
+                                    dir,
+                                    local_sum: 0,
+                                },
+                            ));
+                            continue;
                         }
-                    }
+                    };
 
-                    if job.cursor < job.files.len() {
-                        if let Ok(mut q) = queue.lock() {
-                            q.push_back(job);
-                        } else {
+                    let mut local_sum: u64 = 0;
+
+                    for entry in entries.flatten() {
+                        if cancel.load(Ordering::Relaxed) {
                             break;
                         }
-                    } else {
-                        let _ = tx.send((
-                            generation,
-                            SizeUpdate::DirLocalDone {
-                                dir: job.dir,
-                                local_sum: job.local_sum,
-                            },
-                        ));
+                        let ft = match entry.file_type() {
+                            Ok(ft) => ft,
+                            Err(_) => continue,
+                        };
+                        let path = entry.path();
+
+                        if ft.is_file() {
+                            // Use cached size if available, otherwise stat.
+                            let size = if let Some(&s) = ctx.known_file_sizes.get(&path) {
+                                s
+                            } else if let Ok(meta) = entry.metadata() {
+                                let s = meta.len();
+                                let _ = tx.send((
+                                    generation,
+                                    SizeUpdate::File {
+                                        path: path.clone(),
+                                        size: s,
+                                    },
+                                ));
+                                s
+                            } else {
+                                continue;
+                            };
+                            local_sum = local_sum.saturating_add(size);
+                        } else if ft.is_dir() {
+                            if ctx.tree_dirs.contains(&path) {
+                                // Tree child dir — handled by the cascade,
+                                // don't count it here.
+                            } else {
+                                // Non-tree child dir (gitignored, hidden, or
+                                // beyond display depth) — recursively walk it.
+                                local_sum = local_sum
+                                    .saturating_add(recursive_dir_size(&path, &cancel));
+                            }
+                        }
+                        // Symlinks and other special files are intentionally
+                        // skipped to avoid double-counting.
                     }
+
+                    let _ = tx.send((
+                        generation,
+                        SizeUpdate::DirLocalDone { dir, local_sum },
+                    ));
                 }
 
                 let _ = tx.send((generation, SizeUpdate::WorkerDone));
@@ -225,6 +283,73 @@ fn start_size_computation(
         children_sum,
         local_done,
         finished: HashSet::new(),
+        cancel,
+    }
+}
+
+/// Recursively compute the total size of all files under `dir`.
+fn recursive_dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+
+    total
+}
+
+/// Process a single size update message.  Returns `true` if a `DirLocalDone`
+/// was applied (meaning `finalize_ready_dirs` should be called afterward).
+fn apply_size_update(
+    state: &mut AppState,
+    size_compute: &mut Option<SizeComputeState>,
+    generation: u64,
+    update: SizeUpdate,
+) -> bool {
+    if generation != state.size_compute_generation {
+        return false;
+    }
+    let Some(ref mut compute) = size_compute else {
+        return false;
+    };
+    if compute.generation != generation {
+        return false;
+    }
+    match update {
+        SizeUpdate::File { path, size } => {
+            state.file_sizes.insert(path, size);
+            false
+        }
+        SizeUpdate::DirLocalDone { dir, local_sum } => {
+            compute.local_done.insert(dir.clone(), local_sum);
+            // Cache for future recomputes so this dir won't need a worker.
+            state.dir_local_sums.insert(dir, local_sum);
+            true
+        }
+        SizeUpdate::WorkerDone => {
+            compute.remaining_workers = compute.remaining_workers.saturating_sub(1);
+            false
+        }
     }
 }
 
@@ -320,6 +445,10 @@ async fn main() -> Result<()> {
     loop {
         if state.needs_size_recompute {
             state.needs_size_recompute = false;
+            // Signal old workers to stop before starting new ones.
+            if let Some(ref old) = size_compute {
+                old.cancel.store(true, Ordering::Relaxed);
+            }
             size_compute = Some(start_size_computation(&mut state, &size_tx));
             if let Some(ref mut compute) = size_compute {
                 finalize_ready_dirs(&mut state, compute);
@@ -381,23 +510,25 @@ async fn main() -> Result<()> {
             }
 
             Some((generation, update)) = size_rx.recv() => {
-                // Drop stale updates from older computations.
-                if generation == state.size_compute_generation {
+                // Process the first message, then batch-drain all remaining
+                // available messages before redrawing.  This prevents stale
+                // messages from old (cancelled) workers from causing
+                // per-message redraws that stall visible progress.
+                let mut need_finalize = false;
+                need_finalize |= apply_size_update(
+                    &mut state, &mut size_compute, generation, update,
+                );
+
+                // Drain everything currently queued without blocking.
+                while let Ok((gen, upd)) = size_rx.try_recv() {
+                    need_finalize |= apply_size_update(
+                        &mut state, &mut size_compute, gen, upd,
+                    );
+                }
+
+                if need_finalize {
                     if let Some(ref mut compute) = size_compute {
-                        if compute.generation == generation {
-                            match update {
-                                SizeUpdate::File { path, size } => {
-                                    state.file_sizes.insert(path, size);
-                                }
-                                SizeUpdate::DirLocalDone { dir, local_sum } => {
-                                    compute.local_done.insert(dir, local_sum);
-                                    finalize_ready_dirs(&mut state, compute);
-                                }
-                                SizeUpdate::WorkerDone => {
-                                    compute.remaining_workers = compute.remaining_workers.saturating_sub(1);
-                                }
-                            }
-                        }
+                        finalize_ready_dirs(&mut state, compute);
                     }
                 }
             }

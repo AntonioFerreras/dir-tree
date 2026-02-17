@@ -109,7 +109,7 @@ pub fn group_children(
 
 /// Human-readable size string.
 pub fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;
     for &unit in UNITS {
         if size < 1024.0 {
@@ -117,6 +117,6 @@ pub fn human_size(bytes: u64) -> String {
         }
         size /= 1024.0;
     }
-    format!("{size:.1} PB")
+    format!("{size:.1} PiB")
 }
 

@@ -65,6 +65,10 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
                 // Lazy-load children if needed, then expand.
                 let _ = fs::expand_node(&mut state.tree, node_id, &state.walk_config);
                 state.tree.get_mut(node_id).expanded = true;
+                // Invalidate this dir's cached local_sum — its set of
+                // tree-children just changed, so it needs re-walking.
+                let path = state.tree.get(node_id).meta.path.clone();
+                state.dir_local_sums.remove(&path);
                 state.needs_size_recompute = true;
             }
         }
@@ -263,6 +267,10 @@ fn rebuild_tree(state: &mut AppState) {
         state.tree = tree;
         state.tree_state.selected = 0;
         state.tree_state.offset = 0;
+        // Full rebuild changes which files/dirs are in the tree, so clear
+        // all cached sizes to avoid stale data.
+        state.file_sizes.clear();
+        state.dir_local_sums.clear();
         state.needs_size_recompute = true;
     }
 }

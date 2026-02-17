@@ -4,6 +4,7 @@
 //! Run with `--init-bash` to print the shell function for your `.bashrc`.
 
 mod app;
+mod config;
 mod core;
 mod shell;
 mod ui;
@@ -421,7 +422,8 @@ async fn main() -> Result<()> {
     walk_config.show_hidden = cli.hidden;
 
     let tree = core::fs::build_tree(&root, &walk_config)?;
-    let mut state = AppState::new(root, tree);
+    let user_config = config::AppConfig::load();
+    let mut state = AppState::new(root, tree, user_config);
     state.walk_config = walk_config;
     state.needs_size_recompute = true;
 
@@ -472,10 +474,9 @@ async fn main() -> Result<()> {
 
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);
 
+            let hint = state.config.status_bar_hint();
             let status_text = match state.active_view {
-                ActiveView::Tree => state.status_message.as_deref().unwrap_or(
-                    "↑↓: navigate | ←→: collapse/expand | Alt+↑↓: jump dirs | Enter: cd | ?: settings",
-                ),
+                ActiveView::Tree => state.status_message.as_deref().unwrap_or(&hint),
                 ActiveView::SettingsMenu | ActiveView::ControlsSubmenu => "",
             };
             let status = Paragraph::new(status_text).style(Theme::status_bar_style());
@@ -491,7 +492,14 @@ async fn main() -> Result<()> {
                     );
                 }
                 ActiveView::ControlsSubmenu => {
-                    frame.render_widget(popup::ControlsPopup, frame.area());
+                    frame.render_widget(
+                        popup::ControlsPopup {
+                            config: &state.config,
+                            selected: state.controls_selected,
+                            awaiting_rebind: state.awaiting_rebind,
+                        },
+                        frame.area(),
+                    );
                 }
                 ActiveView::Tree => {}
             }

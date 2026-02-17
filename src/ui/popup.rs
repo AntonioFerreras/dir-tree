@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::handler::SETTINGS_ITEMS;
+use crate::config::{Action, AppConfig};
 
 // ───────────────────────────────────────── settings popup ────
 
@@ -67,12 +68,18 @@ impl Widget for SettingsPopup {
 
 // ───────────────────────────────────────── controls popup ────
 
-/// Controls / keybinding reference popup overlay.
-pub struct ControlsPopup;
+/// Interactive controls / keybinding popup overlay.
+pub struct ControlsPopup<'a> {
+    pub config: &'a AppConfig,
+    pub selected: usize,
+    pub awaiting_rebind: bool,
+}
 
-impl Widget for ControlsPopup {
+impl<'a> Widget for ControlsPopup<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let popup = centered_fixed(44, 22, area);
+        // Action::ALL.len() actions + 2 blanks + 1 reset + 1 hint + 2 border = ~17
+        let height = (Action::ALL.len() as u16) + 7;
+        let popup = centered_fixed(52, height, area);
         Clear.render(popup, buf);
 
         let block = Block::default()
@@ -89,51 +96,89 @@ impl Widget for ControlsPopup {
         let inner = block.inner(popup);
         block.render(popup, buf);
 
-        let section = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        let key = Style::default().fg(Color::Yellow);
-        let desc = Style::default().fg(Color::White);
         let dim = Style::default().fg(Color::DarkGray);
+        let mut lines = Vec::new();
 
-        let lines = vec![
-            Line::raw(""),
-            Line::from(Span::styled("  Navigation", section)),
-            control_line("    ↑ / k", "Move up", key, desc),
-            control_line("    ↓ / j", "Move down", key, desc),
-            control_line("    ← / h", "Collapse / parent", key, desc),
-            control_line("    → / l", "Expand directory", key, desc),
-            control_line("    Alt+↑", "Prev sibling dir", key, desc),
-            control_line("    Alt+↓", "Next sibling dir", key, desc),
-            control_line("    Enter", "cd into directory", key, desc),
-            Line::raw(""),
-            Line::from(Span::styled("  View", section)),
-            control_line("    .", "Toggle hidden files", key, desc),
-            Line::raw(""),
-            Line::from(Span::styled("  General", section)),
-            control_line("    ?", "Settings menu", key, desc),
-            control_line("    q / Ctrl+c", "Quit", key, desc),
-            Line::raw(""),
-            Line::from(Span::styled("  Esc back  q close", dim)),
-        ];
+        lines.push(Line::raw(""));
+
+        // ── Action rows ─────────────────────────────────────────
+        for (i, &action) in Action::ALL.iter().enumerate() {
+            let is_selected = i == self.selected;
+
+            let prefix = if is_selected { " ▸ " } else { "   " };
+            let label = action.label();
+
+            let keys_display = if is_selected && self.awaiting_rebind {
+                "Press a key…".to_string()
+            } else {
+                self.config.display_bindings(action)
+            };
+
+            let base_style = if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let key_style = if is_selected && self.awaiting_rebind {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+
+            // Fixed-width columns: label left-aligned, keys right-aligned.
+            let label_col = format!("{prefix}{label:<22}");
+            let inner_width = inner.width as usize;
+            let keys_width = inner_width.saturating_sub(label_col.len()).max(1);
+            let keys_col = format!("{keys_display:>keys_width$}");
+
+            lines.push(Line::from(vec![
+                Span::styled(label_col, base_style),
+                Span::styled(keys_col, key_style),
+            ]));
+        }
+
+        // ── Reset option ────────────────────────────────────────
+        let reset_idx = Action::ALL.len();
+        let is_reset_selected = self.selected == reset_idx;
+
+        lines.push(Line::raw(""));
+        let reset_style = if is_reset_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let reset_prefix = if is_reset_selected { " ▸ " } else { "   " };
+        lines.push(Line::from(Span::styled(
+            format!("{reset_prefix}⟳ Reset to defaults"),
+            reset_style,
+        )));
+
+        // ── Hint bar ────────────────────────────────────────────
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  Enter: add key  Del: clear  Esc: back",
+            dim,
+        )));
 
         Paragraph::new(lines).render(inner, buf);
     }
 }
 
 // ───────────────────────────────────────── helpers ───────────
-
-fn control_line<'a>(
-    key_text: &'a str,
-    desc_text: &'a str,
-    key_style: Style,
-    desc_style: Style,
-) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(format!("{key_text:<16}"), key_style),
-        Span::styled(desc_text, desc_style),
-    ])
-}
 
 /// Create a centered rectangle with fixed dimensions, clamped to the available area.
 fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
@@ -143,4 +188,3 @@ fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
 }
-

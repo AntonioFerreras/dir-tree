@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::config::AppConfig;
 use crate::core::{
     fs::WalkConfig,
     grouping::GroupingConfig,
@@ -43,8 +44,15 @@ pub struct AppState {
     pub status_message: Option<String>,
     /// Which view / overlay is currently shown.
     pub active_view: ActiveView,
+    /// User-configurable keybindings.
+    pub config: AppConfig,
     /// Currently highlighted item in the settings menu.
     pub settings_selected: usize,
+    /// Currently highlighted item in the controls submenu.
+    pub controls_selected: usize,
+    /// When `true`, the controls submenu is waiting for the user to press
+    /// a key to rebind the action at `controls_selected`.
+    pub awaiting_rebind: bool,
     /// Computed directory sizes (path → total bytes).  Populated asynchronously
     /// by a background thread.
     pub dir_sizes: HashMap<PathBuf, u64>,
@@ -61,7 +69,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(cwd: PathBuf, tree: DirTree) -> Self {
+    pub fn new(cwd: PathBuf, tree: DirTree, config: AppConfig) -> Self {
         Self {
             tree,
             tree_state: TreeWidgetState::default(),
@@ -72,7 +80,10 @@ impl AppState {
             should_quit: false,
             status_message: None,
             active_view: ActiveView::default(),
+            config,
             settings_selected: 0,
+            controls_selected: 0,
+            awaiting_rebind: false,
             dir_sizes: HashMap::new(),
             file_sizes: HashMap::new(),
             dir_local_sums: HashMap::new(),

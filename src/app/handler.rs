@@ -1,7 +1,10 @@
 //! Input handling — maps key/mouse events to state mutations.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
+use crate::config::{Action, KeyBind};
 use crate::core::fs;
 use crate::core::tree::NodeId;
 
@@ -10,6 +13,11 @@ use crate::ui::tree_widget::{TreeRow, TreeWidget};
 
 /// Menu items shown in the settings popup.
 pub const SETTINGS_ITEMS: &[&str] = &["Controls"];
+
+/// Total selectable rows in the controls submenu (actions + "Reset").
+pub fn controls_item_count() -> usize {
+    Action::ALL.len() + 1
+}
 
 /// Process a key event, dispatching based on the active view.
 pub fn handle_key(state: &mut AppState, key: KeyEvent) {
@@ -22,62 +30,57 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) {
     match state.active_view {
         ActiveView::Tree => handle_tree_key(state, key),
         ActiveView::SettingsMenu => handle_settings_key(state, key),
-        ActiveView::ControlsSubmenu => handle_controls_key(state, key),
+        ActiveView::ControlsSubmenu => {
+            if state.awaiting_rebind {
+                handle_rebind_key(state, key);
+            } else {
+                handle_controls_key(state, key);
+            }
+        }
     }
 }
 
-// ── Tree view ────────────────────────────────────────────────────
+// ── Tree view (configurable bindings) ───────────────────────────
 
 fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
-    match (key.modifiers, key.code) {
-        // ── Quit ───────────────────────────────────────────────
-        (_, KeyCode::Char('q')) => {
+    let Some(action) = state.config.match_key(key) else {
+        return;
+    };
+
+    match action {
+        Action::Quit => {
             state.should_quit = true;
         }
-
-        // ── Settings ──────────────────────────────────────────
-        (_, KeyCode::Char('?')) => {
+        Action::OpenSettings => {
             state.active_view = ActiveView::SettingsMenu;
             state.settings_selected = 0;
         }
-
-        // ── Alt+navigation: jump between sibling dirs ─────────
-        // (must come before plain navigation to avoid being caught by `_`)
-        (m, KeyCode::Down) if m.contains(KeyModifiers::ALT) => {
-            jump_to_sibling_dir(state, Direction::Down);
-        }
-        (m, KeyCode::Up) if m.contains(KeyModifiers::ALT) => {
-            jump_to_sibling_dir(state, Direction::Up);
-        }
-
-        // ── Navigation ────────────────────────────────────────
-        (_, KeyCode::Up) | (_, KeyCode::Char('k')) => {
+        Action::MoveUp => {
             state.tree_state.select_prev();
         }
-        (_, KeyCode::Down) | (_, KeyCode::Char('j')) => {
+        Action::MoveDown => {
             let visible_count = state.tree.visible_nodes().len();
             state.tree_state.select_next(visible_count);
         }
-
-        // ── Expand / collapse ─────────────────────────────────
-        (_, KeyCode::Right) | (_, KeyCode::Char('l')) => {
+        Action::Expand => {
             if let Some(node_id) = selected_node_id(state) {
-                // Lazy-load children if needed, then expand.
                 let _ = fs::expand_node(&mut state.tree, node_id, &state.walk_config);
                 state.tree.get_mut(node_id).expanded = true;
-                // Invalidate this dir's cached local_sum — its set of
-                // tree-children just changed, so it needs re-walking.
                 let path = state.tree.get(node_id).meta.path.clone();
                 state.dir_local_sums.remove(&path);
                 state.needs_size_recompute = true;
             }
         }
-        (_, KeyCode::Left) | (_, KeyCode::Char('h')) => {
-            handle_left(state);
+        Action::Collapse => {
+            handle_collapse(state);
         }
-
-        // ── Enter: cd into directory ──────────────────────────
-        (_, KeyCode::Enter) => {
+        Action::JumpSiblingUp => {
+            jump_to_sibling_dir(state, Direction::Up);
+        }
+        Action::JumpSiblingDown => {
+            jump_to_sibling_dir(state, Direction::Down);
+        }
+        Action::CdIntoDir => {
             if let Some(node_id) = selected_node_id(state) {
                 let node = state.tree.get(node_id);
                 if node.meta.is_dir {
@@ -86,19 +89,15 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
                 }
             }
         }
-
-        // ── Toggle hidden files ───────────────────────────────
-        (_, KeyCode::Char('.')) => {
+        Action::ToggleHidden => {
             state.walk_config.show_hidden = !state.walk_config.show_hidden;
             rebuild_tree(state);
         }
-
-        _ => {}
     }
 }
 
-/// Handle Left key: collapse expanded dir, or go to parent for files/collapsed dirs.
-fn handle_left(state: &mut AppState) {
+/// Handle collapse: collapse expanded dir, or go to parent for files/collapsed dirs.
+fn handle_collapse(state: &mut AppState) {
     let Some(node_id) = selected_node_id(state) else {
         return;
     };
@@ -106,12 +105,9 @@ fn handle_left(state: &mut AppState) {
     let node = state.tree.get(node_id);
 
     if node.meta.is_dir && node.expanded {
-        // Expanded dir → just collapse it.
         state.tree.get_mut(node_id).expanded = false;
     } else if let Some(parent_id) = state.tree.get(node_id).parent {
-        // File or collapsed dir → collapse parent and select it.
         state.tree.get_mut(parent_id).expanded = false;
-        // Find parent's row index in the updated visible rows.
         let rows = build_rows(state);
         for (i, row) in rows.iter().enumerate() {
             if let TreeRow::Node { node_id: nid, .. } = row {
@@ -130,10 +126,6 @@ enum Direction {
 }
 
 /// Jump to the next/previous sibling directory.
-///
-/// From a file, jumps to the next dir at the parent's depth (i.e. a sibling of
-/// the containing folder).  From a directory, jumps to the next dir at the same
-/// depth.
 fn jump_to_sibling_dir(state: &mut AppState, direction: Direction) {
     let rows = build_rows(state);
     let current = state.tree_state.selected;
@@ -180,7 +172,7 @@ fn jump_to_sibling_dir(state: &mut AppState, direction: Direction) {
     }
 }
 
-// ── Settings menu ────────────────────────────────────────────────
+// ── Settings menu (hardcoded keys) ──────────────────────────────
 
 fn handle_settings_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
@@ -198,36 +190,90 @@ fn handle_settings_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
             if state.settings_selected == 0 {
                 state.active_view = ActiveView::ControlsSubmenu;
+                state.controls_selected = 0;
             }
         }
         _ => {}
     }
 }
 
-// ── Controls submenu ─────────────────────────────────────────────
+// ── Controls submenu (hardcoded navigation, interactive rebinding) ──
 
 fn handle_controls_key(state: &mut AppState, key: KeyEvent) {
+    let item_count = controls_item_count();
+
     match key.code {
-        KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.active_view = ActiveView::Tree;
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
             state.active_view = ActiveView::SettingsMenu;
         }
-        KeyCode::Char('q') => {
-            state.active_view = ActiveView::Tree;
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.controls_selected = state.controls_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.controls_selected < item_count - 1 {
+                state.controls_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if state.controls_selected < Action::ALL.len() {
+                // Start rebinding the selected action.
+                state.awaiting_rebind = true;
+            } else {
+                // "Reset to defaults" item.
+                state.config.reset_defaults();
+                let _ = state.config.save();
+            }
+        }
+        KeyCode::Delete | KeyCode::Backspace => {
+            // Clear all bindings for the selected action.
+            if state.controls_selected < Action::ALL.len() {
+                let action = Action::ALL[state.controls_selected];
+                state.config.bindings.insert(action, Vec::new());
+                let _ = state.config.save();
+            }
         }
         _ => {}
     }
 }
 
+/// Capture the next key press as a new binding.
+fn handle_rebind_key(state: &mut AppState, key: KeyEvent) {
+    // Only process Press events (ignore Release/Repeat on supported terminals).
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    // Esc cancels rebinding.
+    if key.code == KeyCode::Esc {
+        state.awaiting_rebind = false;
+        return;
+    }
+
+    // Don't allow rebinding Ctrl+C (reserved for emergency quit).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return;
+    }
+
+    let action = Action::ALL[state.controls_selected];
+    let bind = KeyBind::from_key_event(key);
+    state.config.add_binding(action, bind);
+    let _ = state.config.save();
+    state.awaiting_rebind = false;
+}
+
+// ── Mouse ───────────────────────────────────────────────────────
+
 /// Process a mouse event.
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
-    // Ignore mouse events when a menu overlay is open.
     if state.active_view != ActiveView::Tree {
         return;
     }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // Click on a row → select it.
             let clicked_row = mouse.row.saturating_sub(1) as usize + state.tree_state.offset;
             let visible = state.tree.visible_nodes();
             if clicked_row < visible.len() {
@@ -247,12 +293,10 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
 
 // ── helpers ─────────────────────────────────────────────────────
 
-/// Build the flat list of visible rows.
 fn build_rows(state: &AppState) -> Vec<TreeRow> {
     TreeWidget::new(&state.tree, &state.grouping_config).build_rows()
 }
 
-/// Map the current selection index back to a [`NodeId`].
 fn selected_node_id(state: &AppState) -> Option<NodeId> {
     let rows = build_rows(state);
     rows.get(state.tree_state.selected).and_then(|row| match row {
@@ -261,14 +305,11 @@ fn selected_node_id(state: &AppState) -> Option<NodeId> {
     })
 }
 
-/// Rebuild the tree from the current cwd (e.g. after toggling hidden files).
 fn rebuild_tree(state: &mut AppState) {
     if let Ok(tree) = fs::build_tree(&state.cwd, &state.walk_config) {
         state.tree = tree;
         state.tree_state.selected = 0;
         state.tree_state.offset = 0;
-        // Full rebuild changes which files/dirs are in the tree, so clear
-        // all cached sizes to avoid stale data.
         state.file_sizes.clear();
         state.dir_local_sums.clear();
         state.needs_size_recompute = true;

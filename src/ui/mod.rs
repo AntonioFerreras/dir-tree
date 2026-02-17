@@ -4,6 +4,7 @@
 //! the terminal.  No filesystem I/O happens here.
 
 pub mod layout;
+pub mod popup;
 pub mod theme;
 pub mod tree_widget;
 

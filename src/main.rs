@@ -28,11 +28,11 @@ use ratatui::{
 use crate::app::{
     event::{spawn_event_reader, AppEvent},
     handler,
-    state::AppState,
+    state::{ActiveView, AppState},
 };
 use crate::core::fs;
 use crate::shell::integration;
-use crate::ui::{layout::AppLayout, theme::Theme, tree_widget::TreeWidget};
+use crate::ui::{layout::AppLayout, popup, theme::Theme, tree_widget::TreeWidget};
 
 // ───────────────────────────────────────── CLI ───────────────
 
@@ -103,10 +103,23 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stderr());
     let mut terminal = Terminal::new(backend)?;
 
+    // ── size computation channel ──────────────────────────────
+    let (size_tx, mut size_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(PathBuf, u64)>();
+
+    // Kick off the initial background size computation.
+    spawn_size_computation(&state, &size_tx);
+
     // ── event loop ────────────────────────────────────────────
     let mut events = spawn_event_reader(Duration::from_millis(100));
 
     loop {
+        // If the tree changed (expand / rebuild), compute sizes for new dirs.
+        if state.needs_size_recompute {
+            state.needs_size_recompute = false;
+            spawn_size_computation(&state, &size_tx);
+        }
+
         // ── draw ──────────────────────────────────────────────
         terminal.draw(|frame| {
             let layout = AppLayout::from_area(frame.area());
@@ -118,27 +131,61 @@ async fn main() -> Result<()> {
                 .borders(Borders::ALL)
                 .border_style(Theme::border_style());
 
-            let tree_widget =
-                TreeWidget::new(&state.tree, &state.grouping_config).block(tree_block);
+            let tree_widget = TreeWidget::new(&state.tree, &state.grouping_config)
+                .dir_sizes(&state.dir_sizes)
+                .block(tree_block);
 
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);
 
             // Status bar.
-            let status_text = state
-                .status_message
-                .as_deref()
-                .unwrap_or("q: quit | ↑↓/jk: navigate | ←→/hl: collapse/expand | Enter: cd | .: toggle hidden");
+            let status_text = match state.active_view {
+                ActiveView::Tree => state
+                    .status_message
+                    .as_deref()
+                    .unwrap_or("↑↓: navigate | ←→: collapse/expand | Alt+↑↓: jump dirs | Enter: cd | ?: settings"),
+                ActiveView::SettingsMenu | ActiveView::ControlsSubmenu => "",
+            };
             let status = Paragraph::new(status_text).style(Theme::status_bar_style());
             frame.render_widget(status, layout.status_area);
+
+            // Settings / controls overlay.
+            match state.active_view {
+                ActiveView::SettingsMenu => {
+                    frame.render_widget(
+                        popup::SettingsPopup {
+                            selected: state.settings_selected,
+                        },
+                        frame.area(),
+                    );
+                }
+                ActiveView::ControlsSubmenu => {
+                    frame.render_widget(popup::ControlsPopup, frame.area());
+                }
+                ActiveView::Tree => {}
+            }
         })?;
 
         // ── handle events ─────────────────────────────────────
-        if let Some(event) = events.recv().await {
-            match event {
-                AppEvent::Key(k) => handler::handle_key(&mut state, k),
-                AppEvent::Mouse(m) => handler::handle_mouse(&mut state, m),
-                AppEvent::Resize(_, _) => { /* terminal auto-redraws */ }
-                AppEvent::Tick => { /* just redraw */ }
+        // Use biased select so user input is always prioritised over
+        // background size updates.
+        tokio::select! {
+            biased;
+
+            Some(event) = events.recv() => {
+                match event {
+                    AppEvent::Key(k) => handler::handle_key(&mut state, k),
+                    AppEvent::Mouse(m) => handler::handle_mouse(&mut state, m),
+                    AppEvent::Resize(_, _) => { /* terminal auto-redraws */ }
+                    AppEvent::Tick => { /* just redraw */ }
+                }
+            }
+
+            Some((path, size)) = size_rx.recv() => {
+                state.dir_sizes.insert(path, size);
+                // Drain any additional ready updates to batch redraws.
+                while let Ok((p, s)) = size_rx.try_recv() {
+                    state.dir_sizes.insert(p, s);
+                }
             }
         }
 
@@ -162,4 +209,35 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Spawn a background OS thread that computes total sizes for every directory
+/// in the tree that isn't already cached.  Results are streamed back through
+/// `size_tx` and picked up by the main event loop.
+fn spawn_size_computation(
+    state: &AppState,
+    size_tx: &tokio::sync::mpsc::UnboundedSender<(PathBuf, u64)>,
+) {
+    let needed: Vec<PathBuf> = state
+        .tree
+        .nodes
+        .iter()
+        .filter(|n| n.meta.is_dir && !state.dir_sizes.contains_key(&n.meta.path))
+        .map(|n| n.meta.path.clone())
+        .collect();
+
+    if needed.is_empty() {
+        return;
+    }
+
+    let tx = size_tx.clone();
+    std::thread::spawn(move || {
+        for dir in needed {
+            let size = fs::dir_size(&dir);
+            // If the receiver is dropped (app quit), stop early.
+            if tx.send((dir, size)).is_err() {
+                break;
+            }
+        }
+    });
 }

@@ -44,6 +44,10 @@ impl Theme {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     }
 
+    pub fn size_style() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
     pub fn command_input_style() -> Style {
         Style::default().fg(Color::Yellow)
     }

@@ -3,6 +3,7 @@
 //! All mutable state lives here so that the rest of the app can be pure
 //! functions over `&AppState` (rendering) or `&mut AppState` (event handling).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::core::{
@@ -11,6 +12,15 @@ use crate::core::{
     tree::DirTree,
 };
 use crate::ui::tree_widget::TreeWidgetState;
+
+/// Which view / overlay is currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActiveView {
+    #[default]
+    Tree,
+    SettingsMenu,
+    ControlsSubmenu,
+}
 
 /// Top-level application state.
 pub struct AppState {
@@ -31,6 +41,15 @@ pub struct AppState {
     pub should_quit: bool,
     /// An optional status message shown in the bottom bar.
     pub status_message: Option<String>,
+    /// Which view / overlay is currently shown.
+    pub active_view: ActiveView,
+    /// Currently highlighted item in the settings menu.
+    pub settings_selected: usize,
+    /// Computed directory sizes (path → total bytes).  Populated asynchronously
+    /// by a background thread.
+    pub dir_sizes: HashMap<PathBuf, u64>,
+    /// Flag set by event handlers to trigger a background size recomputation.
+    pub needs_size_recompute: bool,
 }
 
 impl AppState {
@@ -44,6 +63,10 @@ impl AppState {
             selected_dir: None,
             should_quit: false,
             status_message: None,
+            active_view: ActiveView::default(),
+            settings_selected: 0,
+            dir_sizes: HashMap::new(),
+            needs_size_recompute: false,
         }
     }
 }

@@ -1,6 +1,9 @@
 //! Custom Ratatui widget that renders a [`DirTree`] as an indented,
 //! collapsible tree with grouping support.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -74,6 +77,7 @@ pub enum TreeRow {
 pub struct TreeWidget<'a> {
     tree: &'a DirTree,
     grouping_config: &'a GroupingConfig,
+    dir_sizes: Option<&'a HashMap<PathBuf, u64>>,
     block: Option<Block<'a>>,
 }
 
@@ -82,8 +86,14 @@ impl<'a> TreeWidget<'a> {
         Self {
             tree,
             grouping_config,
+            dir_sizes: None,
             block: None,
         }
+    }
+
+    pub fn dir_sizes(mut self, sizes: &'a HashMap<PathBuf, u64>) -> Self {
+        self.dir_sizes = Some(sizes);
+        self
     }
 
     pub fn block(mut self, block: Block<'a>) -> Self {
@@ -170,11 +180,11 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
 
             let line = match row {
                 TreeRow::Node {
+                    node_id,
                     depth,
                     is_dir,
                     expanded,
                     label,
-                    ..
                 } => {
                     let indent = "  ".repeat(*depth);
                     let icon = if *is_dir {
@@ -193,10 +203,31 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                     } else {
                         Theme::file_style()
                     };
-                    Line::from(vec![
+
+                    let mut spans = vec![
                         Span::raw(indent),
                         Span::styled(format!("{icon}{label}"), style),
-                    ])
+                    ];
+
+                    // Show directory size when available.
+                    if *is_dir {
+                        if let Some(sizes) = self.dir_sizes {
+                            let path = &self.tree.get(*node_id).meta.path;
+                            if let Some(&size) = sizes.get(path) {
+                                let size_style = if is_selected {
+                                    Theme::selected_style()
+                                } else {
+                                    Theme::size_style()
+                                };
+                                spans.push(Span::styled(
+                                    format!(" ({})", grouping::human_size(size)),
+                                    size_style,
+                                ));
+                            }
+                        }
+                    }
+
+                    Line::from(spans)
                 }
                 TreeRow::Group { depth, label } => {
                     let indent = "  ".repeat(*depth);

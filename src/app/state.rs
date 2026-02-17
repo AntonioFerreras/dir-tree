@@ -48,8 +48,12 @@ pub struct AppState {
     /// Computed directory sizes (path → total bytes).  Populated asynchronously
     /// by a background thread.
     pub dir_sizes: HashMap<PathBuf, u64>,
+    /// Computed file sizes (path → bytes). Populated asynchronously.
+    pub file_sizes: HashMap<PathBuf, u64>,
     /// Flag set by event handlers to trigger a background size recomputation.
     pub needs_size_recompute: bool,
+    /// Monotonic generation id used to ignore stale background size updates.
+    pub size_compute_generation: u64,
 }
 
 impl AppState {
@@ -66,7 +70,9 @@ impl AppState {
             active_view: ActiveView::default(),
             settings_selected: 0,
             dir_sizes: HashMap::new(),
+            file_sizes: HashMap::new(),
             needs_size_recompute: false,
+            size_compute_generation: 0,
         }
     }
 }

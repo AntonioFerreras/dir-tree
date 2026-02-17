@@ -171,18 +171,4 @@ pub fn expand_node(
     Ok(())
 }
 
-/// Compute the total size in bytes of all regular files under `dir` (recursive).
-///
-/// Symlinks are not followed.  Permission errors are silently skipped.
-/// Designed to be called from a background thread.
-pub fn dir_size(dir: &Path) -> u64 {
-    walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
-}
 

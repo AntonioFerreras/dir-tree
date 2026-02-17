@@ -78,6 +78,7 @@ pub struct TreeWidget<'a> {
     tree: &'a DirTree,
     grouping_config: &'a GroupingConfig,
     dir_sizes: Option<&'a HashMap<PathBuf, u64>>,
+    file_sizes: Option<&'a HashMap<PathBuf, u64>>,
     block: Option<Block<'a>>,
 }
 
@@ -87,12 +88,18 @@ impl<'a> TreeWidget<'a> {
             tree,
             grouping_config,
             dir_sizes: None,
+            file_sizes: None,
             block: None,
         }
     }
 
     pub fn dir_sizes(mut self, sizes: &'a HashMap<PathBuf, u64>) -> Self {
         self.dir_sizes = Some(sizes);
+        self
+    }
+
+    pub fn file_sizes(mut self, sizes: &'a HashMap<PathBuf, u64>) -> Self {
+        self.file_sizes = Some(sizes);
         self
     }
 
@@ -209,22 +216,23 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                         Span::styled(format!("{icon}{label}"), style),
                     ];
 
-                    // Show directory size when available.
-                    if *is_dir {
-                        if let Some(sizes) = self.dir_sizes {
-                            let path = &self.tree.get(*node_id).meta.path;
-                            if let Some(&size) = sizes.get(path) {
-                                let size_style = if is_selected {
-                                    Theme::selected_style()
-                                } else {
-                                    Theme::size_style()
-                                };
-                                spans.push(Span::styled(
-                                    format!(" ({})", grouping::human_size(size)),
-                                    size_style,
-                                ));
-                            }
-                        }
+                    let path = &self.tree.get(*node_id).meta.path;
+                    let maybe_size = if *is_dir {
+                        self.dir_sizes.and_then(|sizes| sizes.get(path).copied())
+                    } else {
+                        self.file_sizes.and_then(|sizes| sizes.get(path).copied())
+                    };
+
+                    if let Some(size) = maybe_size {
+                        let size_style = if is_selected {
+                            Theme::selected_style()
+                        } else {
+                            Theme::size_style()
+                        };
+                        spans.push(Span::styled(
+                            format!(" ({})", grouping::human_size(size)),
+                            size_style,
+                        ));
                     }
 
                     Line::from(spans)

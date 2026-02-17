@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long = "init-bash")]
     init_bash: bool,
 
+    /// Print the zsh shell function and exit.
+    #[arg(long = "init-zsh")]
+    init_zsh: bool,
+
     /// Maximum tree depth.
     #[arg(long, default_value_t = 3)]
     depth: usize,
@@ -71,6 +75,10 @@ async fn main() -> Result<()> {
     // ── shell-integration mode ────────────────────────────────
     if cli.init_bash {
         print!("{}", integration::bash_function());
+        return Ok(());
+    }
+    if cli.init_zsh {
+        print!("{}", integration::zsh_function());
         return Ok(());
     }
 

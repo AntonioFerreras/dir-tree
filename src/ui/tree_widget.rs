@@ -62,8 +62,11 @@ pub enum TreeRow {
         node_id: NodeId,
         depth: usize,
         is_dir: bool,
+        is_symlink: bool,
         expanded: bool,
         label: String,
+        /// For symlinks: the target path (displayed as `→ target`).
+        symlink_target: Option<String>,
     },
     Group {
         depth: usize,
@@ -123,8 +126,10 @@ impl<'a> TreeWidget<'a> {
             node_id,
             depth: node.depth,
             is_dir: node.meta.is_dir,
+            is_symlink: node.meta.is_symlink,
             expanded: node.expanded,
             label: node.meta.name.clone(),
+            symlink_target: node.meta.symlink_target.clone(),
         });
 
         if !node.expanded || !node.meta.is_dir {
@@ -132,7 +137,7 @@ impl<'a> TreeWidget<'a> {
         }
 
         // Apply grouping to this node's children.
-        let grouped = grouping::group_children(self.tree, node_id, self.grouping_config);
+        let grouped = grouping::group_children(self.tree, node_id, self.grouping_config, self.file_sizes);
 
         for entry in grouped {
             match entry {
@@ -190,11 +195,15 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                     node_id,
                     depth,
                     is_dir,
+                    is_symlink,
                     expanded,
                     label,
+                    symlink_target,
                 } => {
                     let indent = "  ".repeat(*depth);
-                    let icon = if *is_dir {
+                    let icon = if *is_symlink {
+                        "~ "
+                    } else if *is_dir {
                         if *expanded {
                             "▼ "
                         } else {
@@ -205,6 +214,8 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                     };
                     let style = if is_selected {
                         Theme::selected_style()
+                    } else if *is_symlink {
+                        Theme::symlink_style()
                     } else if *is_dir {
                         Theme::dir_style()
                     } else {
@@ -215,6 +226,16 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                         Span::raw(indent),
                         Span::styled(format!("{icon}{label}"), style),
                     ];
+
+                    // Show symlink target as `→ target`.
+                    if let Some(target) = symlink_target {
+                        let target_style = if is_selected {
+                            Theme::selected_style()
+                        } else {
+                            Theme::size_style()
+                        };
+                        spans.push(Span::styled(format!(" → {target}"), target_style));
+                    }
 
                     let path = &self.tree.get(*node_id).meta.path;
                     let maybe_size = if *is_dir {

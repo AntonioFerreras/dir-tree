@@ -259,9 +259,24 @@ fn start_size_computation(
                                 local_sum = local_sum
                                     .saturating_add(recursive_dir_size(&path, &cancel));
                             }
+                        } else if ft.is_symlink() {
+                            // Charge the symlink's own apparent size (its
+                            // link-text length as reported by lstat), matching
+                            // `du --apparent-size -P` semantics.
+                            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                                let s = meta.len();
+                                let _ = tx.send((
+                                    generation,
+                                    SizeUpdate::File {
+                                        path: path.clone(),
+                                        size: s,
+                                    },
+                                ));
+                                local_sum = local_sum.saturating_add(s);
+                            }
                         }
-                        // Symlinks and other special files are intentionally
-                        // skipped to avoid double-counting.
+                        // Other special files (FIFOs, sockets, devices)
+                        // contribute 0 bytes.
                     }
 
                     let _ = tx.send((
@@ -310,6 +325,11 @@ fn recursive_dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
                 stack.push(entry.path());
             } else if ft.is_file() {
                 if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            } else if ft.is_symlink() {
+                // Charge the symlink's own apparent size (link-text length).
+                if let Ok(meta) = std::fs::symlink_metadata(&entry.path()) {
                     total = total.saturating_add(meta.len());
                 }
             }

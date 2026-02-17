@@ -17,6 +17,10 @@ impl Theme {
         Style::default().fg(Color::White)
     }
 
+    pub fn symlink_style() -> Style {
+        Style::default().add_modifier(Modifier::ITALIC)
+    }
+
     pub fn group_style() -> Style {
         Style::default()
             .fg(Color::Yellow)

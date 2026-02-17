@@ -35,7 +35,23 @@ impl Default for WalkConfig {
 /// call.  File type comes from `readdir` for free on Unix.
 fn meta_from_dir_entry(entry: &ignore::DirEntry) -> EntryMeta {
     let path = entry.path().to_path_buf();
-    let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
+    let ft = entry.file_type();
+    let is_dir = ft.as_ref().map_or(false, |ft| ft.is_dir());
+    let is_symlink = ft.as_ref().map_or(false, |ft| ft.is_symlink());
+
+    // For symlinks, read the target path and use the link's own apparent size.
+    let (size, symlink_target) = if is_symlink {
+        let target = std::fs::read_link(&path)
+            .ok()
+            .map(|t| t.to_string_lossy().into_owned());
+        let size = std::fs::symlink_metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        (size, target)
+    } else {
+        (0, None)
+    };
+
     EntryMeta {
         name: path
             .file_name()
@@ -45,9 +61,11 @@ fn meta_from_dir_entry(entry: &ignore::DirEntry) -> EntryMeta {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase()),
         is_dir,
-        size: 0,
+        is_symlink,
+        size,
         modified: None,
         path,
+        symlink_target,
     }
 }
 

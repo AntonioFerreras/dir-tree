@@ -5,6 +5,7 @@
 //! produces [`GroupedEntry`] values that the UI renders instead of raw nodes.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::tree::{DirTree, NodeId};
 
@@ -55,6 +56,7 @@ pub fn group_children(
     tree: &DirTree,
     parent_id: NodeId,
     config: &GroupingConfig,
+    file_sizes: Option<&HashMap<PathBuf, u64>>,
 ) -> Vec<GroupedEntry> {
     let parent = tree.get(parent_id);
     let mut result: Vec<GroupedEntry> = Vec::new();
@@ -86,7 +88,16 @@ pub fn group_children(
     for ext in ext_keys {
         let members = ext_buckets.remove(&ext).unwrap();
         if members.len() >= config.min_group_size {
-            let total_size: u64 = members.iter().map(|&id| tree.get(id).meta.size).sum();
+            let total_size: u64 = members
+                .iter()
+                .map(|&id| {
+                    let node = tree.get(id);
+                    // Prefer the async-computed size; fall back to meta.size.
+                    file_sizes
+                        .and_then(|fs| fs.get(&node.meta.path).copied())
+                        .unwrap_or(node.meta.size)
+                })
+                .sum();
             let label = match &ext {
                 Some(e) => format!("*.{e}"),
                 None => "(no extension)".to_string(),

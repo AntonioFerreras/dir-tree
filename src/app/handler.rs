@@ -8,60 +8,9 @@ use crate::config::{Action, KeyBind};
 use crate::core::fs;
 use crate::core::tree::NodeId;
 
+use super::settings::{SettingsItem, SETTINGS_ITEMS};
 use super::state::{ActiveView, AppState};
 use crate::ui::tree_widget::{TreeRow, TreeWidget};
-
-/// A single item in the settings menu.
-pub enum SettingsItem {
-    /// Opens a submenu.
-    Submenu {
-        label: &'static str,
-        view: ActiveView,
-    },
-    /// Boolean toggle — reads/writes via accessors on `AppState`.
-    Toggle {
-        label: &'static str,
-        get: fn(&AppState) -> bool,
-        set: fn(&mut AppState, bool),
-    },
-}
-
-impl SettingsItem {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Submenu { label, .. } | Self::Toggle { label, .. } => label,
-        }
-    }
-}
-
-/// All items shown in the settings popup, in display order.
-pub static SETTINGS_ITEMS: &[SettingsItem] = &[
-    SettingsItem::Submenu {
-        label: "Controls",
-        view: ActiveView::ControlsSubmenu,
-    },
-    SettingsItem::Toggle {
-        label: "Dedup Hard Links",
-        get: |s| s.config.dedup_hard_links,
-        set: |s, v| {
-            s.config.dedup_hard_links = v;
-            let _ = s.config.save();
-            s.dir_local_sums.clear();
-            s.needs_size_recompute = true;
-        },
-    },
-    SettingsItem::Toggle {
-        label: "One File System",
-        get: |s| s.config.one_file_system,
-        set: |s, v| {
-            s.config.one_file_system = v;
-            s.walk_config.one_file_system = v;
-            let _ = s.config.save();
-            // Full rebuild needed since directory visibility changes.
-            rebuild_tree(s);
-        },
-    },
-];
 
 /// Total selectable rows in the controls submenu (actions + "Reset").
 pub fn controls_item_count() -> usize {
@@ -114,7 +63,12 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
         Action::Expand => {
             if let Some(node_id) = selected_node_id(state) {
                 let t0 = std::time::Instant::now();
-                let _ = fs::expand_node(&mut state.tree, node_id, &state.walk_config);
+                let _ = fs::expand_node(
+                    &mut state.tree,
+                    node_id,
+                    &state.walk_config,
+                    state.config.one_file_system,
+                );
                 state.tree.get_mut(node_id).expanded = true;
                 // Invalidate only this dir's cached local_sum — its children
                 // moved from non-tree to tree, changing how bytes are counted.
@@ -368,7 +322,7 @@ fn selected_node_id(state: &AppState) -> Option<NodeId> {
 }
 
 fn rebuild_tree(state: &mut AppState) {
-    if let Ok(tree) = fs::build_tree(&state.cwd, &state.walk_config) {
+    if let Ok(tree) = fs::build_tree(&state.cwd, &state.walk_config, state.config.one_file_system) {
         state.tree = tree;
         state.tree_state.selected = 0;
         state.tree_state.offset = 0;

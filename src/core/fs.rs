@@ -19,9 +19,6 @@ pub struct WalkConfig {
     pub respect_gitignore: bool,
     /// Show hidden (dot-prefixed) entries.
     pub show_hidden: bool,
-    /// Stay on the same filesystem as the root directory.
-    /// Equivalent to `du -x` / `--one-file-system`.
-    pub one_file_system: bool,
 }
 
 impl Default for WalkConfig {
@@ -30,7 +27,6 @@ impl Default for WalkConfig {
             max_depth: 3,
             respect_gitignore: true,
             show_hidden: false,
-            one_file_system: false,
         }
     }
 }
@@ -82,7 +78,7 @@ fn sort_by_name(entries: &mut [EntryMeta]) {
 ///
 /// Uses a **single** `WalkBuilder` pass (one `.gitignore` parse, no redundant
 /// `stat` calls) and assembles the tree in BFS order afterward.
-pub fn build_tree(root: &Path, config: &WalkConfig) -> anyhow::Result<DirTree> {
+pub fn build_tree(root: &Path, config: &WalkConfig, one_file_system: bool) -> anyhow::Result<DirTree> {
     let root_meta = EntryMeta::from_path(root)?;
     let mut tree = DirTree::new(root_meta);
 
@@ -91,7 +87,7 @@ pub fn build_tree(root: &Path, config: &WalkConfig) -> anyhow::Result<DirTree> {
         .max_depth(Some(config.max_depth))
         .hidden(!config.show_hidden)
         .git_ignore(config.respect_gitignore)
-        .same_file_system(config.one_file_system)
+        .same_file_system(one_file_system)
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 
@@ -150,6 +146,7 @@ pub fn expand_node(
     tree: &mut DirTree,
     node_id: NodeId,
     config: &WalkConfig,
+    one_file_system: bool,
 ) -> anyhow::Result<()> {
     let node = tree.get(node_id);
     if !node.meta.is_dir || !node.children.is_empty() {
@@ -163,7 +160,7 @@ pub fn expand_node(
         .max_depth(Some(1))
         .hidden(!config.show_hidden)
         .git_ignore(config.respect_gitignore)
-        .same_file_system(config.one_file_system)
+        .same_file_system(one_file_system)
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 

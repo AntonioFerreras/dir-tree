@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::app::handler::{SettingsItem, SETTINGS_ITEMS};
+use crate::app::settings::{SettingsItem, SETTINGS_ITEMS};
 use crate::app::state::AppState;
 use crate::config::{Action, AppConfig};
 

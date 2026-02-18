@@ -77,6 +77,15 @@ impl<'a> Widget for SettingsPopup<'a> {
                         Span::styled(suffix, toggle_style),
                     ]));
                 }
+                SettingsItem::Cycle { value, .. } => {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{prefix}{label}"), base_style),
+                        Span::styled(
+                            format!("  [{}]", value(self.state)),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                }
             }
         }
         lines.push(Line::raw(""));

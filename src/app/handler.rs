@@ -3,6 +3,7 @@
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::time::Instant;
 
 use crate::config::{Action, KeyBind};
 use crate::core::fs;
@@ -110,6 +111,13 @@ fn handle_collapse(state: &mut AppState) {
         return;
     };
 
+    // On the current tree root, "collapse/parent" means move the whole
+    // browser root up one level so users can navigate above the launch dir.
+    if node_id == state.tree.root {
+        move_root_to_parent(state);
+        return;
+    }
+
     let node = state.tree.get(node_id);
 
     if node.meta.is_dir && node.expanded {
@@ -206,6 +214,9 @@ fn handle_settings_key(state: &mut AppState, key: KeyEvent) {
                         let current = get(state);
                         set(state, !current);
                     }
+                    SettingsItem::Cycle { cycle, .. } => {
+                        cycle(state);
+                    }
                 }
             }
         }
@@ -291,9 +302,44 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let clicked_row = mouse.row.saturating_sub(1) as usize + state.tree_state.offset;
-            let visible = state.tree.visible_nodes();
-            if clicked_row < visible.len() {
+            let rows = build_rows(state);
+            if clicked_row < rows.len() {
                 state.tree_state.selected = clicked_row;
+
+                if let Some(TreeRow::Node {
+                    node_id, is_dir, ..
+                }) = rows.get(clicked_row)
+                {
+                    if *is_dir {
+                        let now = Instant::now();
+                        let is_double_click = state
+                            .last_left_click
+                            .as_ref()
+                            .map(|(last_id, at)| {
+                                *last_id == *node_id
+                                    && now.duration_since(*at)
+                                        <= std::time::Duration::from_millis(
+                                            state.config.double_click_ms,
+                                        )
+                            })
+                            .unwrap_or(false);
+
+                        if is_double_click {
+                            let node = state.tree.get(*node_id);
+                            state.selected_dir = Some(node.meta.path.clone());
+                            state.should_quit = true;
+                            state.last_left_click = None;
+                            return;
+                        }
+
+                        toggle_dir_with_click(state, *node_id);
+                        state.last_left_click = Some((*node_id, now));
+                    } else {
+                        state.last_left_click = None;
+                    }
+                } else {
+                    state.last_left_click = None;
+                }
             }
         }
         MouseEventKind::ScrollUp => {
@@ -321,13 +367,72 @@ fn selected_node_id(state: &AppState) -> Option<NodeId> {
     })
 }
 
+fn toggle_dir_with_click(state: &mut AppState, node_id: NodeId) {
+    if !state.tree.get(node_id).meta.is_dir {
+        return;
+    }
+
+    // Keep mouse behavior consistent with keyboard collapse:
+    // collapsing the current root should navigate to its parent.
+    if node_id == state.tree.root {
+        move_root_to_parent(state);
+        return;
+    }
+
+    if state.tree.get(node_id).expanded {
+        state.tree.get_mut(node_id).expanded = false;
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+    let _ = fs::expand_node(
+        &mut state.tree,
+        node_id,
+        &state.walk_config,
+        state.config.one_file_system,
+    );
+    state.tree.get_mut(node_id).expanded = true;
+
+    // Invalidate only this dir's cached local_sum — its children moved
+    // from non-tree to tree, changing how bytes are counted.
+    let path = state.tree.get(node_id).meta.path.clone();
+    state.dir_local_sums.remove(&path);
+    state.needs_size_recompute = true;
+    tracing::debug!("expand_node(click): {:.2?} path={}", t0.elapsed(), path.display());
+}
+
 fn rebuild_tree(state: &mut AppState) {
     if let Ok(tree) = fs::build_tree(&state.cwd, &state.walk_config, state.config.one_file_system) {
         state.tree = tree;
         state.tree_state.selected = 0;
         state.tree_state.offset = 0;
+        state.dir_sizes.clear();
         state.file_sizes.clear();
         state.dir_local_sums.clear();
         state.needs_size_recompute = true;
+    }
+}
+
+fn move_root_to_parent(state: &mut AppState) {
+    let Some(parent) = state.cwd.parent().map(|p| p.to_path_buf()) else {
+        state.status_message = Some("Already at filesystem root".to_string());
+        return;
+    };
+
+    match fs::build_tree(&parent, &state.walk_config, state.config.one_file_system) {
+        Ok(tree) => {
+            state.cwd = parent;
+            state.tree = tree;
+            state.tree_state.selected = 0;
+            state.tree_state.offset = 0;
+            state.dir_sizes.clear();
+            state.file_sizes.clear();
+            state.dir_local_sums.clear();
+            state.needs_size_recompute = true;
+            state.status_message = Some(format!("Moved to parent: {}", state.cwd.display()));
+        }
+        Err(_) => {
+            state.status_message = Some("Cannot open parent directory".to_string());
+        }
     }
 }

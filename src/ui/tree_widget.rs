@@ -153,10 +153,7 @@ impl<'a> TreeWidget<'a> {
                     let depth = node.depth + 1;
                     rows.push(TreeRow::Group {
                         depth,
-                        label: format!(
-                            "{count} {label} files ({})",
-                            grouping::human_size(total_size)
-                        ),
+                        label: format!("{count} {label} files {}", grouping::human_size(total_size)),
                     });
                 }
             }
@@ -251,8 +248,18 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                             Theme::size_style()
                         };
                         spans.push(Span::styled(
-                            format!(" ({})", grouping::human_size(size)),
+                            format!(" {}", grouping::human_size(size)),
                             size_style,
+                        ));
+                    }
+
+                    // Hint on selected root: explain how to navigate above
+                    // the launch directory. Keep this at the very end so it
+                    // appears after the size text.
+                    if is_selected && *node_id == self.tree.root {
+                        spans.push(Span::styled(
+                            "  Collapse to see parent directory",
+                            Theme::root_hint_style(),
                         ));
                     }
 

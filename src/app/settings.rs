@@ -18,12 +18,20 @@ pub enum SettingsItem {
         get: fn(&AppState) -> bool,
         set: fn(&mut AppState, bool),
     },
+    /// Cycles through a finite set of values.
+    Cycle {
+        label: &'static str,
+        value: fn(&AppState) -> String,
+        cycle: fn(&mut AppState),
+    },
 }
 
 impl SettingsItem {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Submenu { label, .. } | Self::Toggle { label, .. } => label,
+            Self::Submenu { label, .. }
+            | Self::Toggle { label, .. }
+            | Self::Cycle { label, .. } => label,
         }
     }
 }
@@ -63,6 +71,19 @@ pub static SETTINGS_ITEMS: &[SettingsItem] = &[
                 s.dir_local_sums.clear();
                 s.needs_size_recompute = true;
             }
+        },
+    },
+    SettingsItem::Cycle {
+        label: "Double-click Window",
+        value: |s| format!("{}ms", s.config.double_click_ms),
+        cycle: |s| {
+            const WINDOWS: &[u64] = &[150, 200, 250, 300, 400, 500];
+            let current = s.config.double_click_ms;
+            let idx = WINDOWS.iter().position(|&w| w == current).unwrap_or(2);
+            let next = WINDOWS[(idx + 1) % WINDOWS.len()];
+            s.config.double_click_ms = next;
+            let _ = s.config.save();
+            s.status_message = Some(format!("Double-click window: {}ms", next));
         },
     },
 ];

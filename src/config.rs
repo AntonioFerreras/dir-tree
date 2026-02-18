@@ -238,6 +238,8 @@ pub struct AppConfig {
     pub dedup_hard_links: bool,
     /// Stay on the same filesystem (don't cross mount points).
     pub one_file_system: bool,
+    /// Double-click detection window for mouse directory activation.
+    pub double_click_ms: u64,
 }
 
 impl AppConfig {
@@ -334,11 +336,12 @@ impl AppConfig {
         let path = config_path();
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                let (bindings, dedup, ofs) = Self::parse_config(&contents);
+                let (bindings, dedup, ofs, dclick_ms) = Self::parse_config(&contents);
                 return Self {
                     bindings,
                     dedup_hard_links: dedup,
                     one_file_system: ofs,
+                    double_click_ms: dclick_ms,
                 };
             }
         }
@@ -346,6 +349,7 @@ impl AppConfig {
             bindings: Self::default_bindings(),
             dedup_hard_links: true,
             one_file_system: false,
+            double_click_ms: 250,
         }
     }
 
@@ -359,10 +363,11 @@ impl AppConfig {
         Ok(())
     }
 
-    fn parse_config(s: &str) -> (HashMap<Action, Vec<KeyBind>>, bool, bool) {
+    fn parse_config(s: &str) -> (HashMap<Action, Vec<KeyBind>>, bool, bool, u64) {
         let mut bindings = Self::default_bindings();
         let mut dedup_hard_links = true;
         let mut one_file_system = false;
+        let mut double_click_ms = 250;
 
         for line in s.lines() {
             let line = line.trim();
@@ -385,6 +390,13 @@ impl AppConfig {
                     one_file_system = value == "true";
                     continue;
                 }
+                "double_click_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        // Keep this bounded for predictable UX.
+                        double_click_ms = v.clamp(100, 2000);
+                    }
+                    continue;
+                }
                 _ => {}
             }
 
@@ -404,7 +416,7 @@ impl AppConfig {
             }
         }
 
-        (bindings, dedup_hard_links, one_file_system)
+        (bindings, dedup_hard_links, one_file_system, double_click_ms)
     }
 
     fn serialise(&self) -> String {
@@ -414,6 +426,7 @@ impl AppConfig {
             "# Walk settings".to_string(),
             format!("dedup_hard_links = {}", self.dedup_hard_links),
             format!("one_file_system = {}", self.one_file_system),
+            format!("double_click_ms = {}", self.double_click_ms),
             String::new(),
             "# Key bindings".to_string(),
             "# Format: action = Key1, Key2, ...".to_string(),

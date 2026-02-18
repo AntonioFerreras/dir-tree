@@ -10,7 +10,7 @@ use crate::config::AppConfig;
 use crate::core::{
     fs::WalkConfig,
     grouping::GroupingConfig,
-    tree::DirTree,
+    tree::{DirTree, NodeId},
 };
 use crate::ui::tree_widget::TreeWidgetState;
 
@@ -68,6 +68,8 @@ pub struct AppState {
     pub size_compute_generation: u64,
     /// `true` while background size workers are still running.
     pub scanning: bool,
+    /// Last left-clicked directory node and click time, for double-click.
+    pub last_left_click: Option<(NodeId, std::time::Instant)>,
 }
 
 impl AppState {
@@ -92,6 +94,7 @@ impl AppState {
             needs_size_recompute: false,
             size_compute_generation: 0,
             scanning: false,
+            last_left_click: None,
         }
     }
 }

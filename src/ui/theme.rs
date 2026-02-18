@@ -52,6 +52,12 @@ impl Theme {
         Style::default().fg(Color::DarkGray)
     }
 
+    pub fn root_hint_style() -> Style {
+        Style::default()
+            .fg(Color::Rgb(200, 140, 60))
+            .add_modifier(Modifier::DIM)
+    }
+
     pub fn command_input_style() -> Style {
         Style::default().fg(Color::Yellow)
     }

@@ -10,9 +10,11 @@ use crate::config::AppConfig;
 use crate::core::{
     fs::WalkConfig,
     grouping::GroupingConfig,
+    inspector::InspectorInfo,
     tree::{DirTree, NodeId},
 };
 use crate::ui::tree_widget::TreeWidgetState;
+use ratatui::layout::Rect;
 
 /// Which view / overlay is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,6 +72,14 @@ pub struct AppState {
     pub scanning: bool,
     /// Last left-clicked directory node and click time, for double-click.
     pub last_left_click: Option<(NodeId, std::time::Instant)>,
+    /// Last terminal area used to render the frame (for mouse hit-testing).
+    pub terminal_area: Rect,
+    /// True while dragging the tree/inspector splitter with mouse.
+    pub dragging_splitter: bool,
+    /// Path currently shown in the inspector cache.
+    pub inspector_path: Option<PathBuf>,
+    /// Cached inspector payload for the selected row.
+    pub inspector_info: Option<InspectorInfo>,
 }
 
 impl AppState {
@@ -95,6 +105,10 @@ impl AppState {
             size_compute_generation: 0,
             scanning: false,
             last_left_click: None,
+            terminal_area: Rect::default(),
+            dragging_splitter: false,
+            inspector_path: None,
+            inspector_info: None,
         }
     }
 }

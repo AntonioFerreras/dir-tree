@@ -5,6 +5,7 @@
 
 pub mod fs;
 pub mod grouping;
+pub mod inspector;
 pub mod size;
 pub mod tree;
 

@@ -22,6 +22,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
+    layout::Rect,
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
@@ -32,7 +33,10 @@ use crate::app::{
     state::{ActiveView, AppState},
 };
 use crate::shell::integration;
-use crate::ui::{layout::AppLayout, popup, spinner::ScanIndicator, theme::Theme, tree_widget::TreeWidget};
+use crate::ui::{
+    inspector::InspectorWidget, layout::AppLayout, popup, spinner::ScanIndicator, theme::Theme,
+    tree_widget::TreeWidget,
+};
 
 // ───────────────────────────────────────── CLI ───────────────
 
@@ -131,11 +135,15 @@ async fn main() -> Result<()> {
 
     // ── event loop ────────────────────────────────────────────
     loop {
+        refresh_inspector(&mut state);
+
         // ── draw first ─────────────────────────────────────────
         // Always render before doing any expensive work so the UI
         // stays responsive.  Sizes fill in asynchronously.
         terminal.draw(|frame| {
-            let layout = AppLayout::from_area(frame.area());
+            state.terminal_area = frame.area();
+            let layout =
+                AppLayout::from_area(frame.area(), state.config.panel_layout, state.config.panel_split_pct);
 
             let tree_block = Block::default()
                 .title(format!(" {} ", state.cwd.display()))
@@ -149,6 +157,19 @@ async fn main() -> Result<()> {
                 .block(tree_block);
 
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);
+
+            let inspector_block = Block::default()
+                .title(" Inspector ")
+                .title_style(Theme::title_style())
+                .borders(Borders::ALL)
+                .border_style(Theme::border_style());
+            frame.render_widget(
+                InspectorWidget {
+                    block: inspector_block,
+                    info: state.inspector_info.as_ref(),
+                },
+                layout.inspector_area,
+            );
 
             // Scanning indicator (top-right of tree area, overlays the border).
             frame.render_widget(
@@ -215,7 +236,9 @@ async fn main() -> Result<()> {
                 match event {
                     AppEvent::Key(k) => handler::handle_key(&mut state, k),
                     AppEvent::Mouse(m) => handler::handle_mouse(&mut state, m),
-                    AppEvent::Resize(_, _) => {}
+                    AppEvent::Resize(w, h) => {
+                        state.terminal_area = Rect::new(0, 0, w, h);
+                    }
                     AppEvent::Tick => {
                         tick_count = tick_count.wrapping_add(1);
                     }
@@ -271,4 +294,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn refresh_inspector(state: &mut AppState) {
+    let selected = handler::selected_node_path(state);
+    if selected == state.inspector_path {
+        // Keep directory/file apparent size fresh even when selection stays put
+        // and async size workers are still updating maps.
+        if let (Some(path), Some(info)) = (selected.as_ref(), state.inspector_info.as_mut()) {
+            if let Some(sz) = state.dir_sizes.get(path).copied() {
+                info.size_bytes = Some(sz);
+            } else if let Some(sz) = state.file_sizes.get(path).copied() {
+                info.size_bytes = Some(sz);
+            }
+        }
+        return;
+    }
+    state.inspector_path = selected.clone();
+    state.inspector_info = selected.as_ref().map(|path| {
+        let mut info = crate::core::inspector::inspect_path(path);
+        if let Some(sz) = state.dir_sizes.get(path).copied() {
+            info.size_bytes = Some(sz);
+        } else if let Some(sz) = state.file_sizes.get(path).copied() {
+            info.size_bytes = Some(sz);
+        }
+        info
+    });
 }

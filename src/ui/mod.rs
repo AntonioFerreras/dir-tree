@@ -3,6 +3,7 @@
 //! This layer takes the *core* data structures and turns them into pixels on
 //! the terminal.  No filesystem I/O happens here.
 
+pub mod inspector;
 pub mod layout;
 pub mod popup;
 pub mod spinner;

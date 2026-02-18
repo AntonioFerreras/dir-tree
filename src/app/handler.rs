@@ -8,6 +8,7 @@ use std::time::Instant;
 use crate::config::{Action, KeyBind};
 use crate::core::fs;
 use crate::core::tree::NodeId;
+use crate::ui::layout::AppLayout;
 
 use super::settings::{SettingsItem, SETTINGS_ITEMS};
 use super::state::{ActiveView, AppState};
@@ -299,9 +300,33 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
         return;
     }
 
+    let layout = AppLayout::from_area(
+        state.terminal_area,
+        state.config.panel_layout,
+        state.config.panel_split_pct,
+    );
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let clicked_row = mouse.row.saturating_sub(1) as usize + state.tree_state.offset;
+            if layout.is_on_splitter(mouse.column, mouse.row) {
+                state.dragging_splitter = true;
+                return;
+            }
+            state.dragging_splitter = false;
+
+            if !point_in_rect(layout.tree_area, mouse.column, mouse.row) {
+                return;
+            }
+            let tree_content_top = layout.tree_area.y.saturating_add(1);
+            let tree_content_bottom = layout
+                .tree_area
+                .y
+                .saturating_add(layout.tree_area.height.saturating_sub(1));
+            if mouse.row < tree_content_top || mouse.row >= tree_content_bottom {
+                return;
+            }
+
+            let clicked_row = mouse.row.saturating_sub(tree_content_top) as usize + state.tree_state.offset;
             let rows = build_rows(state);
             if clicked_row < rows.len() {
                 state.tree_state.selected = clicked_row;
@@ -342,6 +367,17 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                 }
             }
         }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if state.dragging_splitter {
+                if let Some(pct) = layout.split_pct_from_pointer(mouse.column, mouse.row) {
+                    state.config.panel_split_pct = pct;
+                    let _ = state.config.save();
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            state.dragging_splitter = false;
+        }
         MouseEventKind::ScrollUp => {
             state.tree_state.select_prev();
         }
@@ -365,6 +401,11 @@ fn selected_node_id(state: &AppState) -> Option<NodeId> {
         TreeRow::Node { node_id, .. } => Some(*node_id),
         TreeRow::Group { .. } => None,
     })
+}
+
+/// Selected tree entry path, if the currently selected row is a node.
+pub fn selected_node_path(state: &AppState) -> Option<std::path::PathBuf> {
+    selected_node_id(state).map(|id| state.tree.get(id).meta.path.clone())
 }
 
 fn toggle_dir_with_click(state: &mut AppState, node_id: NodeId) {
@@ -435,4 +476,11 @@ fn move_root_to_parent(state: &mut AppState) {
             state.status_message = Some("Cannot open parent directory".to_string());
         }
     }
+}
+
+fn point_in_rect(area: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= area.x
+        && col < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }

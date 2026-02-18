@@ -25,6 +25,47 @@ pub enum Action {
     Quit,
 }
 
+/// Preset two-pane arrangements for tree + inspector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelLayoutMode {
+    TreeLeft,
+    TreeTop,
+    TreeRight,
+    TreeBottom,
+}
+
+impl PanelLayoutMode {
+    pub const ALL: [Self; 4] = [Self::TreeLeft, Self::TreeTop, Self::TreeRight, Self::TreeBottom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TreeLeft => "Tree Left / Inspector Right",
+            Self::TreeTop => "Tree Top / Inspector Bottom",
+            Self::TreeRight => "Tree Right / Inspector Left",
+            Self::TreeBottom => "Tree Bottom / Inspector Top",
+        }
+    }
+
+    fn config_value(self) -> &'static str {
+        match self {
+            Self::TreeLeft => "tree_left",
+            Self::TreeTop => "tree_top",
+            Self::TreeRight => "tree_right",
+            Self::TreeBottom => "tree_bottom",
+        }
+    }
+
+    fn from_config_value(v: &str) -> Option<Self> {
+        match v {
+            "tree_left" => Some(Self::TreeLeft),
+            "tree_top" => Some(Self::TreeTop),
+            "tree_right" => Some(Self::TreeRight),
+            "tree_bottom" => Some(Self::TreeBottom),
+            _ => None,
+        }
+    }
+}
+
 impl Action {
     /// Ordered list of all actions (used for the controls menu).
     pub const ALL: &[Action] = &[
@@ -240,6 +281,10 @@ pub struct AppConfig {
     pub one_file_system: bool,
     /// Double-click detection window for mouse directory activation.
     pub double_click_ms: u64,
+    /// Current pane arrangement for tree + inspector.
+    pub panel_layout: PanelLayoutMode,
+    /// Split between tree and inspector in percent (10..=90).
+    pub panel_split_pct: u16,
 }
 
 impl AppConfig {
@@ -336,12 +381,15 @@ impl AppConfig {
         let path = config_path();
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                let (bindings, dedup, ofs, dclick_ms) = Self::parse_config(&contents);
+                let (bindings, dedup, ofs, dclick_ms, panel_layout, panel_split_pct) =
+                    Self::parse_config(&contents);
                 return Self {
                     bindings,
                     dedup_hard_links: dedup,
                     one_file_system: ofs,
                     double_click_ms: dclick_ms,
+                    panel_layout,
+                    panel_split_pct,
                 };
             }
         }
@@ -350,6 +398,8 @@ impl AppConfig {
             dedup_hard_links: true,
             one_file_system: false,
             double_click_ms: 250,
+            panel_layout: PanelLayoutMode::TreeLeft,
+            panel_split_pct: 60,
         }
     }
 
@@ -363,11 +413,22 @@ impl AppConfig {
         Ok(())
     }
 
-    fn parse_config(s: &str) -> (HashMap<Action, Vec<KeyBind>>, bool, bool, u64) {
+    fn parse_config(
+        s: &str,
+    ) -> (
+        HashMap<Action, Vec<KeyBind>>,
+        bool,
+        bool,
+        u64,
+        PanelLayoutMode,
+        u16,
+    ) {
         let mut bindings = Self::default_bindings();
         let mut dedup_hard_links = true;
         let mut one_file_system = false;
         let mut double_click_ms = 250;
+        let mut panel_layout = PanelLayoutMode::TreeLeft;
+        let mut panel_split_pct: u16 = 60;
 
         for line in s.lines() {
             let line = line.trim();
@@ -397,6 +458,18 @@ impl AppConfig {
                     }
                     continue;
                 }
+                "panel_layout" => {
+                    if let Some(mode) = PanelLayoutMode::from_config_value(value) {
+                        panel_layout = mode;
+                    }
+                    continue;
+                }
+                "panel_split_pct" => {
+                    if let Ok(v) = value.parse::<u16>() {
+                        panel_split_pct = v.clamp(10, 90);
+                    }
+                    continue;
+                }
                 _ => {}
             }
 
@@ -416,7 +489,14 @@ impl AppConfig {
             }
         }
 
-        (bindings, dedup_hard_links, one_file_system, double_click_ms)
+        (
+            bindings,
+            dedup_hard_links,
+            one_file_system,
+            double_click_ms,
+            panel_layout,
+            panel_split_pct,
+        )
     }
 
     fn serialise(&self) -> String {
@@ -427,6 +507,8 @@ impl AppConfig {
             format!("dedup_hard_links = {}", self.dedup_hard_links),
             format!("one_file_system = {}", self.one_file_system),
             format!("double_click_ms = {}", self.double_click_ms),
+            format!("panel_layout = {}", self.panel_layout.config_value()),
+            format!("panel_split_pct = {}", self.panel_split_pct),
             String::new(),
             "# Key bindings".to_string(),
             "# Format: action = Key1, Key2, ...".to_string(),

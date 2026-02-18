@@ -26,6 +26,8 @@ clap = { version = "4", features = ["derive"] }
 # ── Logging (debug builds) ────────────────────────────────────
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = true, features = ["clock"] }
+tree_magic_mini = "3"
 
 [profile.release]
 opt-level = 3

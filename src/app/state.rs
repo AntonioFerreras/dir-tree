@@ -58,10 +58,10 @@ pub struct AppState {
     pub dir_sizes: HashMap<PathBuf, u64>,
     /// Computed file sizes (path → bytes). Populated asynchronously.
     pub file_sizes: HashMap<PathBuf, u64>,
-    /// Cached per-directory `local_sum` from workers (direct files + recursive
-    /// walks of non-tree child dirs).  Survives across recomputes so that only
-    /// directories whose tree-children changed need re-walking.
-    pub dir_local_sums: HashMap<PathBuf, u64>,
+    /// Cached per-directory local walk results from workers.  On expand, only
+    /// the expanded dir's entry is invalidated — all others survive so we
+    /// skip redundant I/O.
+    pub dir_local_sums: HashMap<PathBuf, crate::DirLocalResult>,
     /// Flag set by event handlers to trigger a background size recomputation.
     pub needs_size_recompute: bool,
     /// Monotonic generation id used to ignore stale background size updates.

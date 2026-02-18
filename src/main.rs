@@ -65,10 +65,28 @@ struct Cli {
 
 // ───────────────────────────────────────── size computation ──
 
+/// Map of hard-linked inodes: (dev, ino) → apparent size.
+/// Only files with nlink > 1 land here; nlink == 1 files are summed directly.
+type InodeMap = HashMap<(u64, u64), u64>;
+
+/// Cached result from a directory's local walk.
+#[derive(Clone)]
+struct DirLocalResult {
+    /// Sum of apparent sizes for files with nlink == 1 (safely additive).
+    unique_sum: u64,
+    /// Hard-linked files: (dev, ino) → size.  Deduped within this subtree,
+    /// but may overlap with sibling directories — the cascade merges these.
+    hardlinks: InodeMap,
+}
+
 #[derive(Debug)]
 enum SizeUpdate {
     File { path: PathBuf, size: u64 },
-    DirLocalDone { dir: PathBuf, local_sum: u64 },
+    DirLocalDone {
+        dir: PathBuf,
+        unique_sum: u64,
+        hardlinks: InodeMap,
+    },
     WorkerDone,
 }
 
@@ -78,22 +96,47 @@ struct WorkerCtx {
     /// Workers skip these during their walk because the cascade
     /// handles them separately.
     tree_dirs: HashSet<PathBuf>,
-    /// Snapshot of already-known file sizes (avoids redundant `stat` calls
-    /// on recompute after expand).
-    known_file_sizes: HashMap<PathBuf, u64>,
+    /// Whether hard-link dedup is enabled.
+    dedup_hard_links: bool,
 }
 
 struct SizeComputeState {
     generation: u64,
     remaining_workers: usize,
+    /// Tree directory nodes sorted deepest-first for O(n) cascade.
     dirs: Vec<PathBuf>,
     parent_dir: HashMap<PathBuf, Option<PathBuf>>,
     pending_children: HashMap<PathBuf, usize>,
-    children_sum: HashMap<PathBuf, u64>,
-    local_done: HashMap<PathBuf, u64>,
+    /// Per-dir: accumulated unique_sum from tree-children.
+    children_unique: HashMap<PathBuf, u64>,
+    /// Per-dir: merged hardlink maps from tree-children.
+    children_hardlinks: HashMap<PathBuf, InodeMap>,
+    /// Per-dir: the local walk result (unique_sum + hardlinks).
+    local_done: HashMap<PathBuf, DirLocalResult>,
     finished: HashSet<PathBuf>,
     /// Shared flag used to signal worker threads to stop early.
     cancel: Arc<AtomicBool>,
+}
+
+/// Classify a file as unique or hard-linked, returning `(size, is_hardlink, dev, ino)`.
+/// Files with nlink == 1 are unique and never need inode tracking.
+#[cfg(unix)]
+fn classify_file(meta: &std::fs::Metadata, dedup: bool) -> (u64, Option<(u64, u64)>) {
+    let size = meta.len();
+    if !dedup {
+        return (size, None);
+    }
+    use std::os::unix::fs::MetadataExt;
+    if meta.nlink() <= 1 {
+        (size, None) // unique — no inode tracking needed
+    } else {
+        (size, Some((meta.dev(), meta.ino())))
+    }
+}
+
+#[cfg(not(unix))]
+fn classify_file(meta: &std::fs::Metadata, _dedup: bool) -> (u64, Option<(u64, u64)>) {
+    (meta.len(), None)
 }
 
 fn start_size_computation(
@@ -103,16 +146,13 @@ fn start_size_computation(
     state.size_compute_generation = state.size_compute_generation.wrapping_add(1);
     let generation = state.size_compute_generation;
 
-    // Clear dir sizes (tree structure may have changed, so totals need
-    // recomputation), but KEEP file sizes — individual file sizes remain
-    // valid across expand/collapse and avoid expensive re-stat calls.
-    state.dir_sizes.clear();
+    // Don't clear dir_sizes — stale values are shown briefly until the
+    // cascade overwrites them.  This avoids a visible flicker where sizes
+    // disappear for one frame before being repopulated.
 
     let cancel = Arc::new(AtomicBool::new(false));
 
     // Build a set of all directory paths that are nodes in the display tree.
-    // Workers use this to know which child dirs the cascade already handles
-    // vs which ones need an inline recursive walk.
     let mut tree_dirs = HashSet::new();
     for node in &state.tree.nodes {
         if node.meta.is_dir {
@@ -121,10 +161,12 @@ fn start_size_computation(
     }
 
     let mut dirs = Vec::new();
+    let mut dir_depth: HashMap<PathBuf, usize> = HashMap::new();
     let mut parent_dir: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let mut pending_children: HashMap<PathBuf, usize> = HashMap::new();
-    let mut children_sum: HashMap<PathBuf, u64> = HashMap::new();
-    let mut local_done: HashMap<PathBuf, u64> = HashMap::new();
+    let mut children_unique: HashMap<PathBuf, u64> = HashMap::new();
+    let mut children_hardlinks: HashMap<PathBuf, InodeMap> = HashMap::new();
+    let mut local_done: HashMap<PathBuf, DirLocalResult> = HashMap::new();
     let mut jobs: VecDeque<PathBuf> = VecDeque::new();
 
     for node in &state.tree.nodes {
@@ -134,6 +176,7 @@ fn start_size_computation(
 
         let dir_path = node.meta.path.clone();
         dirs.push(dir_path.clone());
+        dir_depth.insert(dir_path.clone(), node.depth);
 
         let parent_path = node.parent.and_then(|pid| {
             let p = &state.tree.nodes[pid];
@@ -145,9 +188,6 @@ fn start_size_computation(
         });
         parent_dir.insert(dir_path.clone(), parent_path);
 
-        // Count only tree-loaded child directories for the cascade;
-        // non-tree child dirs are walked inline by the worker and
-        // included in local_sum.
         let child_dir_count = node
             .children
             .iter()
@@ -155,22 +195,29 @@ fn start_size_computation(
             .count();
 
         pending_children.insert(dir_path.clone(), child_dir_count);
-        children_sum.insert(dir_path.clone(), 0);
+        children_unique.insert(dir_path.clone(), 0);
+        children_hardlinks.insert(dir_path.clone(), InodeMap::new());
 
-        // If we already have a cached local_sum for this directory, reuse it
-        // instead of spawning a worker job.  The cache is invalidated only for
-        // directories whose tree-children changed (i.e. the expanded dir).
-        if let Some(&cached) = state.dir_local_sums.get(&dir_path) {
-            local_done.insert(dir_path, cached);
+        // Reuse cached local result if available.
+        if let Some(cached) = state.dir_local_sums.get(&dir_path) {
+            local_done.insert(dir_path, cached.clone());
         } else {
             jobs.push_back(dir_path);
         }
     }
 
+    // Sort dirs deepest-first for O(n) cascade finalization.
+    dirs.sort_by(|a, b| {
+        let da = dir_depth.get(a).copied().unwrap_or(0);
+        let db = dir_depth.get(b).copied().unwrap_or(0);
+        db.cmp(&da)
+    });
+
     let queue = Arc::new(Mutex::new(jobs));
+    let dedup_hard_links = state.walk_config.dedup_hard_links;
     let ctx = Arc::new(WorkerCtx {
         tree_dirs,
-        known_file_sizes: state.file_sizes.clone(),
+        dedup_hard_links,
     });
 
     let max_threads = std::thread::available_parallelism()
@@ -204,7 +251,6 @@ fn start_size_computation(
                         }
                     };
 
-                    // Walk the REAL filesystem at depth 1 for this directory.
                     let entries = match std::fs::read_dir(&dir) {
                         Ok(e) => e,
                         Err(_) => {
@@ -212,14 +258,16 @@ fn start_size_computation(
                                 generation,
                                 SizeUpdate::DirLocalDone {
                                     dir,
-                                    local_sum: 0,
+                                    unique_sum: 0,
+                                    hardlinks: InodeMap::new(),
                                 },
                             ));
                             continue;
                         }
                     };
 
-                    let mut local_sum: u64 = 0;
+                    let mut unique_sum: u64 = 0;
+                    let mut hardlinks = InodeMap::new();
 
                     for entry in entries.flatten() {
                         if cancel.load(Ordering::Relaxed) {
@@ -232,10 +280,7 @@ fn start_size_computation(
                         let path = entry.path();
 
                         if ft.is_file() {
-                            // Use cached size if available, otherwise stat.
-                            let size = if let Some(&s) = ctx.known_file_sizes.get(&path) {
-                                s
-                            } else if let Ok(meta) = entry.metadata() {
+                            if let Ok(meta) = entry.metadata() {
                                 let s = meta.len();
                                 let _ = tx.send((
                                     generation,
@@ -244,25 +289,25 @@ fn start_size_computation(
                                         size: s,
                                     },
                                 ));
-                                s
-                            } else {
-                                continue;
-                            };
-                            local_sum = local_sum.saturating_add(size);
+                                let (size, inode_key) = classify_file(&meta, ctx.dedup_hard_links);
+                                match inode_key {
+                                    None => unique_sum = unique_sum.saturating_add(size),
+                                    Some(key) => { hardlinks.entry(key).or_insert(size); }
+                                }
+                            }
                         } else if ft.is_dir() {
                             if ctx.tree_dirs.contains(&path) {
-                                // Tree child dir — handled by the cascade,
-                                // don't count it here.
+                                // Tree child dir — cascade handles it.
                             } else {
-                                // Non-tree child dir (gitignored, hidden, or
-                                // beyond display depth) — recursively walk it.
-                                local_sum = local_sum
-                                    .saturating_add(recursive_dir_size(&path, &cancel));
+                                // Non-tree child dir — recursively walk it.
+                                let (sub_unique, sub_hardlinks) =
+                                    recursive_dir_size(&path, &cancel, ctx.dedup_hard_links);
+                                unique_sum = unique_sum.saturating_add(sub_unique);
+                                for (k, v) in sub_hardlinks {
+                                    hardlinks.entry(k).or_insert(v);
+                                }
                             }
                         } else if ft.is_symlink() {
-                            // Charge the symlink's own apparent size (its
-                            // link-text length as reported by lstat), matching
-                            // `du --apparent-size -P` semantics.
                             if let Ok(meta) = std::fs::symlink_metadata(&path) {
                                 let s = meta.len();
                                 let _ = tx.send((
@@ -272,16 +317,14 @@ fn start_size_computation(
                                         size: s,
                                     },
                                 ));
-                                local_sum = local_sum.saturating_add(s);
+                                unique_sum = unique_sum.saturating_add(s);
                             }
                         }
-                        // Other special files (FIFOs, sockets, devices)
-                        // contribute 0 bytes.
                     }
 
                     let _ = tx.send((
                         generation,
-                        SizeUpdate::DirLocalDone { dir, local_sum },
+                        SizeUpdate::DirLocalDone { dir, unique_sum, hardlinks },
                     ));
                 }
 
@@ -296,7 +339,8 @@ fn start_size_computation(
         dirs,
         parent_dir,
         pending_children,
-        children_sum,
+        children_unique,
+        children_hardlinks,
         local_done,
         finished: HashSet::new(),
         cancel,
@@ -304,8 +348,10 @@ fn start_size_computation(
 }
 
 /// Recursively compute the total size of all files under `dir`.
-fn recursive_dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
-    let mut total: u64 = 0;
+/// Returns (unique_sum, hardlinks) — split by nlink for cascade dedup.
+fn recursive_dir_size(dir: &Path, cancel: &AtomicBool, dedup: bool) -> (u64, InodeMap) {
+    let mut unique_sum: u64 = 0;
+    let mut hardlinks = InodeMap::new();
     let mut stack = vec![dir.to_path_buf()];
 
     while let Some(current) = stack.pop() {
@@ -325,18 +371,21 @@ fn recursive_dir_size(dir: &Path, cancel: &AtomicBool) -> u64 {
                 stack.push(entry.path());
             } else if ft.is_file() {
                 if let Ok(meta) = entry.metadata() {
-                    total = total.saturating_add(meta.len());
+                    let (size, inode_key) = classify_file(&meta, dedup);
+                    match inode_key {
+                        None => unique_sum = unique_sum.saturating_add(size),
+                        Some(key) => { hardlinks.entry(key).or_insert(size); }
+                    }
                 }
             } else if ft.is_symlink() {
-                // Charge the symlink's own apparent size (link-text length).
                 if let Ok(meta) = std::fs::symlink_metadata(&entry.path()) {
-                    total = total.saturating_add(meta.len());
+                    unique_sum = unique_sum.saturating_add(meta.len());
                 }
             }
         }
     }
 
-    total
+    (unique_sum, hardlinks)
 }
 
 /// Process a single size update message.  Returns `true` if a `DirLocalDone`
@@ -361,10 +410,11 @@ fn apply_size_update(
             state.file_sizes.insert(path, size);
             false
         }
-        SizeUpdate::DirLocalDone { dir, local_sum } => {
-            compute.local_done.insert(dir.clone(), local_sum);
-            // Cache for future recomputes so this dir won't need a worker.
-            state.dir_local_sums.insert(dir, local_sum);
+        SizeUpdate::DirLocalDone { dir, unique_sum, hardlinks } => {
+            let result = DirLocalResult { unique_sum, hardlinks };
+            // Cache for future recomputes.
+            state.dir_local_sums.insert(dir.clone(), result.clone());
+            compute.local_done.insert(dir, result);
             true
         }
         SizeUpdate::WorkerDone => {
@@ -374,41 +424,77 @@ fn apply_size_update(
     }
 }
 
+/// O(n) cascade: process dirs deepest-first, merging hardlink maps bottom-up.
+///
+/// Each directory's total = unique_bytes + sum(hardlink_map.values()), where
+/// hardlink_map is the union of the dir's own hardlinks and all children's
+/// hardlink maps.  This means a hard-linked file counts independently in
+/// each leaf directory, but is deduped in any common ancestor.
 fn finalize_ready_dirs(state: &mut AppState, compute: &mut SizeComputeState) {
-    loop {
-        let mut progressed = false;
+    for i in 0..compute.dirs.len() {
+        let dir = compute.dirs[i].clone();
+        if compute.finished.contains(&dir) {
+            continue;
+        }
 
-        for dir in &compute.dirs {
-            if compute.finished.contains(dir) {
-                continue;
+        // Check readiness without removing yet.
+        if !compute.local_done.contains_key(&dir) {
+            continue;
+        }
+        let pending = *compute.pending_children.get(&dir).unwrap_or(&0);
+        if pending != 0 {
+            continue;
+        }
+
+        // Take ownership — no cloning.
+        let local = compute.local_done.remove(&dir).unwrap();
+        let children_unique = compute.children_unique.remove(&dir).unwrap_or(0);
+        let children_hl = compute.children_hardlinks.remove(&dir).unwrap_or_default();
+
+        let total_unique = local.unique_sum.saturating_add(children_unique);
+
+        // Merge hardlink maps: pick the larger map as the base to minimise
+        // insertions, then extend from the smaller one.
+        let mut merged_hardlinks;
+        if local.hardlinks.len() >= children_hl.len() {
+            merged_hardlinks = local.hardlinks;
+            for (k, v) in children_hl {
+                merged_hardlinks.entry(k).or_insert(v);
             }
-
-            let local = match compute.local_done.get(dir) {
-                Some(v) => *v,
-                None => continue,
-            };
-            let pending = *compute.pending_children.get(dir).unwrap_or(&0);
-            if pending != 0 {
-                continue;
-            }
-
-            let total = local.saturating_add(*compute.children_sum.get(dir).unwrap_or(&0));
-            state.dir_sizes.insert(dir.clone(), total);
-            compute.finished.insert(dir.clone());
-            progressed = true;
-
-            if let Some(Some(parent)) = compute.parent_dir.get(dir) {
-                if let Some(remaining) = compute.pending_children.get_mut(parent) {
-                    *remaining = remaining.saturating_sub(1);
-                }
-                if let Some(sum) = compute.children_sum.get_mut(parent) {
-                    *sum = sum.saturating_add(total);
-                }
+        } else {
+            merged_hardlinks = children_hl;
+            for (k, v) in local.hardlinks {
+                merged_hardlinks.entry(k).or_insert(v);
             }
         }
 
-        if !progressed {
-            break;
+        let hardlink_bytes: u64 = merged_hardlinks.values().sum();
+        let total = total_unique.saturating_add(hardlink_bytes);
+
+        state.dir_sizes.insert(dir.clone(), total);
+        compute.finished.insert(dir.clone());
+
+        // Propagate to parent — move the merged map, don't copy.
+        if let Some(Some(parent)) = compute.parent_dir.get(&dir) {
+            if let Some(remaining) = compute.pending_children.get_mut(parent) {
+                *remaining = remaining.saturating_sub(1);
+            }
+            if let Some(sum) = compute.children_unique.get_mut(parent) {
+                *sum = sum.saturating_add(total_unique);
+            }
+            // Merge into parent's children_hardlinks.  If the parent has
+            // no accumulated map yet, just move ours in wholesale.
+            let parent_hl = compute
+                .children_hardlinks
+                .entry(parent.clone())
+                .or_default();
+            if parent_hl.is_empty() {
+                *parent_hl = merged_hardlinks;
+            } else {
+                for (k, v) in merged_hardlinks {
+                    parent_hl.entry(k).or_insert(v);
+                }
+            }
         }
     }
 }
@@ -465,19 +551,9 @@ async fn main() -> Result<()> {
 
     // ── event loop ────────────────────────────────────────────
     loop {
-        if state.needs_size_recompute {
-            state.needs_size_recompute = false;
-            // Signal old workers to stop before starting new ones.
-            if let Some(ref old) = size_compute {
-                old.cancel.store(true, Ordering::Relaxed);
-            }
-            size_compute = Some(start_size_computation(&mut state, &size_tx));
-            if let Some(ref mut compute) = size_compute {
-                finalize_ready_dirs(&mut state, compute);
-            }
-        }
-
-        // ── draw ──────────────────────────────────────────────
+        // ── draw first ─────────────────────────────────────────
+        // Always render before doing any expensive work so the UI
+        // stays responsive.  Sizes fill in asynchronously.
         terminal.draw(|frame| {
             let layout = AppLayout::from_area(frame.area());
 
@@ -524,6 +600,22 @@ async fn main() -> Result<()> {
                 ActiveView::Tree => {}
             }
         })?;
+
+        // ── kick off size recompute AFTER draw ───────────────────
+        // The draw above already rendered the updated tree structure
+        // (expanded dirs, new entries).  Now we compute sizes — cached
+        // dirs finalize immediately, uncached ones arrive via workers.
+        // Sizes appear on the next frame; the expand itself is instant.
+        if state.needs_size_recompute {
+            state.needs_size_recompute = false;
+            if let Some(ref old) = size_compute {
+                old.cancel.store(true, Ordering::Relaxed);
+            }
+            size_compute = Some(start_size_computation(&mut state, &size_tx));
+            if let Some(ref mut compute) = size_compute {
+                finalize_ready_dirs(&mut state, compute);
+            }
+        }
 
         tokio::select! {
             biased;

@@ -64,11 +64,16 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
         }
         Action::Expand => {
             if let Some(node_id) = selected_node_id(state) {
+                let t0 = std::time::Instant::now();
                 let _ = fs::expand_node(&mut state.tree, node_id, &state.walk_config);
                 state.tree.get_mut(node_id).expanded = true;
+                // Invalidate only this dir's cached local_sum — its children
+                // moved from non-tree to tree, changing how bytes are counted.
+                // All other dirs' caches remain valid.
                 let path = state.tree.get(node_id).meta.path.clone();
                 state.dir_local_sums.remove(&path);
                 state.needs_size_recompute = true;
+                tracing::debug!("expand_node: {:.2?} path={}", t0.elapsed(), path.display());
             }
         }
         Action::Collapse => {

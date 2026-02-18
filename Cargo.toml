@@ -28,6 +28,9 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = true, features = ["clock"] }
 tree_magic_mini = "3"
+image = { version = "0.25", default-features = false, features = [
+    "png", "jpeg", "gif", "webp", "bmp", "tiff", "ico",
+] }
 
 [profile.release]
 opt-level = 3

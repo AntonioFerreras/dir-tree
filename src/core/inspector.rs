@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use image::ImageDecoder;
+
 #[derive(Debug, Clone)]
 pub struct InspectorInfo {
     pub path: PathBuf,
@@ -23,6 +25,18 @@ pub struct InspectorInfo {
     pub subfiles: Option<u64>,
     pub others: Option<u64>,
     pub error: Option<String>,
+    // ── image-specific metadata ──
+    pub image_width: Option<u32>,
+    pub image_height: Option<u32>,
+    pub image_pixel_format: Option<String>,
+    pub image_channels: Option<u8>,
+}
+
+impl InspectorInfo {
+    /// True when the inspected path is a recognised image file.
+    pub fn is_image(&self) -> bool {
+        self.image_width.is_some()
+    }
 }
 
 pub fn inspect_path(path: &Path) -> InspectorInfo {
@@ -46,6 +60,10 @@ pub fn inspect_path(path: &Path) -> InspectorInfo {
         subfiles: None,
         others: None,
         error: None,
+        image_width: None,
+        image_height: None,
+        image_pixel_format: None,
+        image_channels: None,
     };
 
     let meta = match std::fs::symlink_metadata(path) {
@@ -87,6 +105,24 @@ pub fn inspect_path(path: &Path) -> InspectorInfo {
         info.kind = "File".to_string();
         info.size_bytes = Some(meta.len());
         info.detected_type = detect_file_type(path);
+        // Extract image metadata if this looks like an image.
+        // Check MIME from tree_magic_mini first; fall back to the image
+        // crate's own format guessing so we catch formats (webp, etc.)
+        // that tree_magic_mini's shared-mime-info DB may not know about.
+        let mime_says_image = info
+            .detected_type
+            .as_deref()
+            .map_or(false, |m| m.starts_with("image/"));
+        let image_crate_knows = || {
+            image::ImageReader::open(path)
+                .ok()
+                .and_then(|r| r.with_guessed_format().ok())
+                .and_then(|r| r.format())
+                .is_some()
+        };
+        if mime_says_image || image_crate_knows() {
+            extract_image_meta(path, &mut info);
+        }
     } else {
         info.kind = "Other".to_string();
         info.size_bytes = Some(0);
@@ -132,6 +168,43 @@ fn count_immediate_children(path: &Path) -> (u64, u64, u64, Option<String>) {
 
 fn to_unix_secs(t: Option<SystemTime>) -> Option<u64> {
     t.and_then(|v| v.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()))
+}
+
+/// Populate image-specific fields (resolution, pixel format, channels).
+/// Uses only the image header — no full pixel decode.
+fn extract_image_meta(path: &Path, info: &mut InspectorInfo) {
+    // image::image_dimensions reads just the header (fast).
+    if let Ok((w, h)) = image::image_dimensions(path) {
+        info.image_width = Some(w);
+        info.image_height = Some(h);
+    }
+    // For color type we need the decoder, which is still cheap (no full decode).
+    if let Ok(reader) = image::ImageReader::open(path) {
+        if let Ok(reader) = reader.with_guessed_format() {
+            if let Ok(decoder) = reader.into_decoder() {
+                let ct = decoder.color_type();
+                let (fmt, ch) = color_type_desc(ct);
+                info.image_pixel_format = Some(fmt.to_string());
+                info.image_channels = Some(ch);
+            }
+        }
+    }
+}
+
+fn color_type_desc(ct: image::ColorType) -> (&'static str, u8) {
+    match ct {
+        image::ColorType::L8 => ("Grayscale 8-bit", 1),
+        image::ColorType::La8 => ("Grayscale+Alpha 8-bit", 2),
+        image::ColorType::Rgb8 => ("RGB 8-bit", 3),
+        image::ColorType::Rgba8 => ("RGBA 8-bit", 4),
+        image::ColorType::L16 => ("Grayscale 16-bit", 1),
+        image::ColorType::La16 => ("Grayscale+Alpha 16-bit", 2),
+        image::ColorType::Rgb16 => ("RGB 16-bit", 3),
+        image::ColorType::Rgba16 => ("RGBA 16-bit", 4),
+        image::ColorType::Rgb32F => ("RGB 32-bit float", 3),
+        image::ColorType::Rgba32F => ("RGBA 32-bit float", 4),
+        _ => ("Unknown", 0),
+    }
 }
 
 fn detect_file_type(path: &Path) -> Option<String> {

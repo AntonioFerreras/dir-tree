@@ -30,7 +30,7 @@ use ratatui::{
 use crate::app::{
     event::{spawn_event_reader, AppEvent},
     handler,
-    state::{ActiveView, AppState},
+    state::{ActiveView, AppState, PaneFocus},
 };
 use crate::shell::integration;
 use crate::ui::{
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // ── async channels ────────────────────────────────────────
-    let mut events = spawn_event_reader(Duration::from_millis(100));
+    let mut events = spawn_event_reader(Duration::from_millis(50));
     let (size_tx, mut size_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, SizeUpdate)>();
     let mut size_compute: Option<SizeComputeState> = None;
     let mut tick_count: u64 = 0;
@@ -145,11 +145,26 @@ async fn main() -> Result<()> {
             let layout =
                 AppLayout::from_area(frame.area(), state.config.panel_layout, state.config.panel_split_pct);
 
+            let tree_focused = state.pane_focus == PaneFocus::Tree;
+            let inspector_focused = state.pane_focus == PaneFocus::Inspector;
+
             let tree_block = Block::default()
-                .title(format!(" {} ", state.cwd.display()))
-                .title_style(Theme::title_style())
+                .title(format!(
+                    " Tree{} · Tab: switch pane ",
+                    if tree_focused { " [focused]" } else { "" }
+                ))
+                .title_style(if tree_focused {
+                    Theme::title_style()
+                } else {
+                    Theme::size_style()
+                })
+                .title_bottom(format!(" {} ", state.cwd.display()))
                 .borders(Borders::ALL)
-                .border_style(Theme::border_style());
+                .border_style(if tree_focused {
+                    ratatui::style::Style::default().fg(ratatui::style::Color::LightBlue)
+                } else {
+                    Theme::border_style()
+                });
 
             let tree_widget = TreeWidget::new(&state.tree, &state.grouping_config)
                 .dir_sizes(&state.dir_sizes)
@@ -159,14 +174,37 @@ async fn main() -> Result<()> {
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);
 
             let inspector_block = Block::default()
-                .title(" Inspector ")
-                .title_style(Theme::title_style())
+                .title(format!(
+                    " Inspector{} · Tab: switch pane ",
+                    if inspector_focused { " [focused]" } else { "" }
+                ))
+                .title_style(if inspector_focused {
+                    Theme::title_style()
+                } else {
+                    Theme::size_style()
+                })
                 .borders(Borders::ALL)
-                .border_style(Theme::border_style());
+                .border_style(if inspector_focused {
+                    ratatui::style::Style::default().fg(ratatui::style::Color::LightBlue)
+                } else {
+                    Theme::border_style()
+                });
             frame.render_widget(
                 InspectorWidget {
                     block: inspector_block,
                     info: state.inspector_info.as_ref(),
+                    pinned: &state.pinned_inspector,
+                    pin_scroll: state.inspector_pin_scroll,
+                    scroll_row_offset: state.pin_scroll_anim.row_offset(),
+                    selected_pin: if state.pane_focus != PaneFocus::Inspector
+                        || state.pinned_inspector.is_empty()
+                    {
+                        None
+                    } else {
+                        Some(state.inspector_selected_pin)
+                    },
+                    has_focus: state.pane_focus == PaneFocus::Inspector,
+                    image_cache: &state.image_cache,
                 },
                 layout.inspector_area,
             );
@@ -241,6 +279,9 @@ async fn main() -> Result<()> {
                     }
                     AppEvent::Tick => {
                         tick_count = tick_count.wrapping_add(1);
+                        // Drive smooth-scroll animation (detect target change → inject row offset → decay).
+                        state.pin_scroll_anim.set_target(state.inspector_pin_scroll, 12.0);
+                        state.pin_scroll_anim.tick();
                     }
                 }
             }
@@ -308,6 +349,15 @@ fn refresh_inspector(state: &mut AppState) {
                 info.size_bytes = Some(sz);
             }
         }
+        for pin in &mut state.pinned_inspector {
+            if let Some(sz) = state.dir_sizes.get(&pin.path).copied() {
+                pin.size_bytes = Some(sz);
+            } else if let Some(sz) = state.file_sizes.get(&pin.path).copied() {
+                pin.size_bytes = Some(sz);
+            }
+        }
+        // Ensure images are cached for current + pinned.
+        cache_images_if_needed(state);
         return;
     }
     state.inspector_path = selected.clone();
@@ -320,4 +370,39 @@ fn refresh_inspector(state: &mut AppState) {
         }
         info
     });
+
+    for pin in &mut state.pinned_inspector {
+        if let Some(sz) = state.dir_sizes.get(&pin.path).copied() {
+            pin.size_bytes = Some(sz);
+        } else if let Some(sz) = state.file_sizes.get(&pin.path).copied() {
+            pin.size_bytes = Some(sz);
+        }
+    }
+    cache_images_if_needed(state);
+}
+
+/// Lazily decode images for the current selection and all pinned cards.
+/// Results are cached so each image is only decoded once.
+fn cache_images_if_needed(state: &mut AppState) {
+    // Collect paths that need decoding to avoid borrow issues.
+    let mut to_decode: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Some(info) = &state.inspector_info {
+        if info.is_image() && !state.image_cache.contains_key(&info.path) {
+            to_decode.push(info.path.clone());
+        }
+    }
+    for pin in &state.pinned_inspector {
+        if pin.is_image() && !state.image_cache.contains_key(&pin.path) {
+            to_decode.push(pin.path.clone());
+        }
+    }
+
+    for path in to_decode {
+        if let Ok(img) = image::open(&path) {
+            state
+                .image_cache
+                .insert(path, std::sync::Arc::new(img));
+        }
+    }
 }

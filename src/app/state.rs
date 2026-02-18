@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::AppConfig;
 use crate::core::{
@@ -23,6 +24,14 @@ pub enum ActiveView {
     Tree,
     SettingsMenu,
     ControlsSubmenu,
+}
+
+/// Which main pane currently owns keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneFocus {
+    #[default]
+    Tree,
+    Inspector,
 }
 
 /// Top-level application state.
@@ -80,6 +89,19 @@ pub struct AppState {
     pub inspector_path: Option<PathBuf>,
     /// Cached inspector payload for the selected row.
     pub inspector_info: Option<InspectorInfo>,
+    /// Which pane receives keyboard navigation in main tree view.
+    pub pane_focus: PaneFocus,
+    /// Pinned inspector cards, created from tree entries.
+    pub pinned_inspector: Vec<InspectorInfo>,
+    /// Selected pinned card index.
+    pub inspector_selected_pin: usize,
+    /// Vertical scroll offset into pinned cards (logical target).
+    pub inspector_pin_scroll: usize,
+    /// Smooth-scroll animator for the pinned cards list.
+    /// Smooth-scroll row-offset animator for the pinned cards list.
+    pub pin_scroll_anim: crate::ui::smooth_scroll::SmoothScroll,
+    /// Cached decoded images for preview (path → DynamicImage).
+    pub image_cache: HashMap<PathBuf, Arc<image::DynamicImage>>,
 }
 
 impl AppState {
@@ -109,6 +131,12 @@ impl AppState {
             dragging_splitter: false,
             inspector_path: None,
             inspector_info: None,
+            pane_focus: PaneFocus::Tree,
+            pinned_inspector: Vec::new(),
+            inspector_selected_pin: 0,
+            inspector_pin_scroll: 0,
+            pin_scroll_anim: crate::ui::smooth_scroll::SmoothScroll::new(0.35),
+            image_cache: HashMap::new(),
         }
     }
 }

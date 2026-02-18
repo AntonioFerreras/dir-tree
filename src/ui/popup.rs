@@ -59,7 +59,7 @@ impl<'a> Widget for SettingsPopup<'a> {
 
             match item {
                 SettingsItem::Submenu { .. } => {
-                    lines.push(Line::from(Span::styled(
+            lines.push(Line::from(Span::styled(
                         format!("{prefix}{label}"),
                         base_style,
                     )));

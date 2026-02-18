@@ -8,10 +8,11 @@ use std::time::Instant;
 use crate::config::{Action, KeyBind};
 use crate::core::fs;
 use crate::core::tree::NodeId;
+use crate::ui::inspector::pinned_cards_geometry;
 use crate::ui::layout::AppLayout;
 
 use super::settings::{SettingsItem, SETTINGS_ITEMS};
-use super::state::{ActiveView, AppState};
+use super::state::{ActiveView, AppState, PaneFocus};
 use crate::ui::tree_widget::{TreeRow, TreeWidget};
 
 /// Total selectable rows in the controls submenu (actions + "Reset").
@@ -43,6 +44,51 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) {
 // ── Tree view (configurable bindings) ───────────────────────────
 
 fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
+    if key.code == KeyCode::Tab {
+        state.pane_focus = match state.pane_focus {
+            PaneFocus::Tree => PaneFocus::Inspector,
+            PaneFocus::Inspector => PaneFocus::Tree,
+        };
+        return;
+    }
+
+    if state.pane_focus == PaneFocus::Inspector {
+        // While inspector is focused, tree navigation/actions are disabled.
+        // Allow inspector-local keys plus global quit/settings actions.
+        if handle_inspector_focus_key(state, key) {
+            return;
+        }
+        if let Some(action) = state.config.match_key(key) {
+            match action {
+                Action::Quit => state.should_quit = true,
+                Action::OpenSettings => {
+                    state.active_view = ActiveView::SettingsMenu;
+                    state.settings_selected = 0;
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    // Navigation keys that should always work in tree view.
+    match key.code {
+        KeyCode::Home => {
+            // Root is always the first visible row.
+            state.tree_state.selected = 0;
+            state.tree_state.offset = 0;
+            return;
+        }
+        KeyCode::End => {
+            let rows = build_rows(state);
+            if !rows.is_empty() {
+                state.tree_state.selected = rows.len() - 1;
+            }
+            return;
+        }
+        _ => {}
+    }
+
     let Some(action) = state.config.match_key(key) else {
         return;
     };
@@ -63,6 +109,7 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
             state.tree_state.select_next(visible_count);
         }
         Action::Expand => {
+            maybe_pin_selected_non_dir(state);
             if let Some(node_id) = selected_node_id(state) {
                 let t0 = std::time::Instant::now();
                 let _ = fs::expand_node(
@@ -314,9 +361,16 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
             }
             state.dragging_splitter = false;
 
+            if point_in_rect(layout.inspector_area, mouse.column, mouse.row) {
+                state.pane_focus = PaneFocus::Inspector;
+                handle_inspector_click(state, layout.inspector_area, mouse.column, mouse.row);
+                return;
+            }
+
             if !point_in_rect(layout.tree_area, mouse.column, mouse.row) {
                 return;
             }
+            state.pane_focus = PaneFocus::Tree;
             let tree_content_top = layout.tree_area.y.saturating_add(1);
             let tree_content_bottom = layout
                 .tree_area
@@ -379,9 +433,25 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
             state.dragging_splitter = false;
         }
         MouseEventKind::ScrollUp => {
+            if point_in_rect(layout.inspector_area, mouse.column, mouse.row)
+                || state.pane_focus == PaneFocus::Inspector
+            {
+                if state.inspector_pin_scroll > 0 {
+                    state.inspector_pin_scroll -= 1;
+                }
+                return;
+            }
             state.tree_state.select_prev();
         }
         MouseEventKind::ScrollDown => {
+            if point_in_rect(layout.inspector_area, mouse.column, mouse.row)
+                || state.pane_focus == PaneFocus::Inspector
+            {
+                let geom = inspector_geom(state);
+                state.inspector_pin_scroll =
+                    (state.inspector_pin_scroll + 1).min(geom.max_scroll);
+                return;
+            }
             let visible_count = state.tree.visible_nodes().len();
             state.tree_state.select_next(visible_count);
         }
@@ -440,6 +510,173 @@ fn toggle_dir_with_click(state: &mut AppState, node_id: NodeId) {
     state.dir_local_sums.remove(&path);
     state.needs_size_recompute = true;
     tracing::debug!("expand_node(click): {:.2?} path={}", t0.elapsed(), path.display());
+}
+
+fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if state.inspector_selected_pin > 0 {
+                state.inspector_selected_pin -= 1;
+                clamp_inspector_selection_and_scroll(state);
+            }
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !state.pinned_inspector.is_empty()
+                && state.inspector_selected_pin + 1 < state.pinned_inspector.len()
+            {
+                state.inspector_selected_pin += 1;
+                clamp_inspector_selection_and_scroll(state);
+            }
+            true
+        }
+        KeyCode::Home => {
+            if !state.pinned_inspector.is_empty() {
+                state.inspector_selected_pin = 0;
+                clamp_inspector_selection_and_scroll(state);
+            }
+            true
+        }
+        KeyCode::End => {
+            if !state.pinned_inspector.is_empty() {
+                state.inspector_selected_pin = state.pinned_inspector.len() - 1;
+                clamp_inspector_selection_and_scroll(state);
+            }
+            true
+        }
+        KeyCode::Delete | KeyCode::Backspace => {
+            remove_selected_pin(state);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_inspector_click(state: &mut AppState, inspector_area: ratatui::layout::Rect, col: u16, row: u16) {
+    let inner = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(inspector_area);
+    let geom = pinned_cards_geometry(
+        inner,
+        state.inspector_info.as_ref(),
+        &state.pinned_inspector,
+        state.inspector_pin_scroll,
+    );
+
+    for card in geom.cards {
+        if point_in_rect(card.unpin_rect, col, row) {
+            remove_pin_at(state, card.pin_index);
+            return;
+        }
+        if point_in_rect(card.card_rect, col, row) {
+            state.inspector_selected_pin = card.pin_index;
+            clamp_inspector_selection_and_scroll(state);
+            return;
+        }
+    }
+}
+
+fn maybe_pin_selected_non_dir(state: &mut AppState) {
+    let Some(node_id) = selected_node_id(state) else {
+        return;
+    };
+    if state.tree.get(node_id).meta.is_dir {
+        return;
+    }
+    let path = state.tree.get(node_id).meta.path.clone();
+
+    if let Some((idx, _)) = state
+        .pinned_inspector
+        .iter()
+        .enumerate()
+        .find(|(_, info)| info.path == path)
+    {
+        state.inspector_selected_pin = idx;
+        clamp_inspector_selection_and_scroll(state);
+        return;
+    }
+
+    let mut info = crate::core::inspector::inspect_path(&path);
+    if let Some(sz) = state.dir_sizes.get(&path).copied() {
+        info.size_bytes = Some(sz);
+    } else if let Some(sz) = state.file_sizes.get(&path).copied() {
+        info.size_bytes = Some(sz);
+    }
+    state.pinned_inspector.push(info);
+    state.inspector_selected_pin = state.pinned_inspector.len().saturating_sub(1);
+    clamp_inspector_selection_and_scroll(state);
+}
+
+fn remove_selected_pin(state: &mut AppState) {
+    if state.pinned_inspector.is_empty() {
+        return;
+    }
+    remove_pin_at(state, state.inspector_selected_pin);
+}
+
+fn remove_pin_at(state: &mut AppState, index: usize) {
+    if index >= state.pinned_inspector.len() {
+        return;
+    }
+    state.pinned_inspector.remove(index);
+    if state.inspector_selected_pin >= state.pinned_inspector.len() && !state.pinned_inspector.is_empty() {
+        state.inspector_selected_pin = state.pinned_inspector.len() - 1;
+    }
+    if state.pinned_inspector.is_empty() {
+        state.inspector_selected_pin = 0;
+        state.inspector_pin_scroll = 0;
+    } else {
+        clamp_inspector_selection_and_scroll(state);
+    }
+}
+
+fn inspector_geom(state: &AppState) -> crate::ui::inspector::PinnedCardsGeometry {
+    let layout = AppLayout::from_area(
+        state.terminal_area,
+        state.config.panel_layout,
+        state.config.panel_split_pct,
+    );
+    let inner = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(layout.inspector_area);
+    pinned_cards_geometry(
+        inner,
+        state.inspector_info.as_ref(),
+        &state.pinned_inspector,
+        state.inspector_pin_scroll,
+    )
+}
+
+fn clamp_inspector_selection_and_scroll(state: &mut AppState) {
+    if state.pinned_inspector.is_empty() {
+        state.inspector_selected_pin = 0;
+        state.inspector_pin_scroll = 0;
+        return;
+    }
+
+    if state.inspector_selected_pin >= state.pinned_inspector.len() {
+        state.inspector_selected_pin = state.pinned_inspector.len() - 1;
+    }
+
+    let geom = inspector_geom(state);
+    state.inspector_pin_scroll = state.inspector_pin_scroll.min(geom.max_scroll);
+
+    if geom.visible_cards == 0 {
+        state.inspector_pin_scroll = 0;
+        return;
+    }
+
+    if state.inspector_selected_pin < state.inspector_pin_scroll {
+        state.inspector_pin_scroll = state.inspector_selected_pin;
+    } else {
+        let last_visible = state.inspector_pin_scroll + geom.visible_cards - 1;
+        if state.inspector_selected_pin > last_visible {
+            state.inspector_pin_scroll = state
+                .inspector_selected_pin
+                .saturating_sub(geom.visible_cards.saturating_sub(1));
+        }
+    }
+    state.inspector_pin_scroll = state.inspector_pin_scroll.min(geom.max_scroll);
 }
 
 fn rebuild_tree(state: &mut AppState) {

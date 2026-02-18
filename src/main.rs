@@ -61,6 +61,10 @@ struct Cli {
     /// Show hidden (dot) files.
     #[arg(long)]
     hidden: bool,
+
+    /// Stay on the same filesystem (don't cross mount points).
+    #[arg(long = "one-file-system", short = 'x')]
+    one_file_system: bool,
 }
 
 // ───────────────────────────────────────── size computation ──
@@ -98,6 +102,10 @@ struct WorkerCtx {
     tree_dirs: HashSet<PathBuf>,
     /// Whether hard-link dedup is enabled.
     dedup_hard_links: bool,
+    /// When `true`, don't descend into directories on a different device.
+    one_file_system: bool,
+    /// Device ID of the root directory (for `one_file_system` checks).
+    root_dev: u64,
 }
 
 struct SizeComputeState {
@@ -116,6 +124,30 @@ struct SizeComputeState {
     finished: HashSet<PathBuf>,
     /// Shared flag used to signal worker threads to stop early.
     cancel: Arc<AtomicBool>,
+}
+
+/// Check whether a directory should be descended into (mount boundary check).
+#[cfg(unix)]
+fn is_same_device(meta: &std::fs::Metadata, root_dev: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.dev() == root_dev
+}
+
+#[cfg(not(unix))]
+fn is_same_device(_meta: &std::fs::Metadata, _root_dev: u64) -> bool {
+    true // no device check on non-Unix
+}
+
+/// Get the device ID of a path.
+#[cfg(unix)]
+fn get_dev(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|m| m.dev()).unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn get_dev(_path: &Path) -> u64 {
+    0
 }
 
 /// Classify a file as unique or hard-linked, returning `(size, is_hardlink, dev, ino)`.
@@ -215,9 +247,13 @@ fn start_size_computation(
 
     let queue = Arc::new(Mutex::new(jobs));
     let dedup_hard_links = state.walk_config.dedup_hard_links;
+    let one_file_system = state.walk_config.one_file_system;
+    let root_dev = get_dev(&state.cwd);
     let ctx = Arc::new(WorkerCtx {
         tree_dirs,
         dedup_hard_links,
+        one_file_system,
+        root_dev,
     });
 
     let max_threads = std::thread::available_parallelism()
@@ -298,10 +334,31 @@ fn start_size_computation(
                         } else if ft.is_dir() {
                             if ctx.tree_dirs.contains(&path) {
                                 // Tree child dir — cascade handles it.
+                            } else if ctx.one_file_system {
+                                // Check mount boundary before descending.
+                                if let Ok(meta) = std::fs::metadata(&path) {
+                                    if is_same_device(&meta, ctx.root_dev) {
+                                        let (sub_unique, sub_hardlinks) =
+                                            recursive_dir_size(
+                                                &path, &cancel,
+                                                ctx.dedup_hard_links,
+                                                true, ctx.root_dev,
+                                            );
+                                        unique_sum = unique_sum.saturating_add(sub_unique);
+                                        for (k, v) in sub_hardlinks {
+                                            hardlinks.entry(k).or_insert(v);
+                                        }
+                                    }
+                                    // else: different device — skip
+                                }
                             } else {
-                                // Non-tree child dir — recursively walk it.
+                                // Cross mount points freely.
                                 let (sub_unique, sub_hardlinks) =
-                                    recursive_dir_size(&path, &cancel, ctx.dedup_hard_links);
+                                    recursive_dir_size(
+                                        &path, &cancel,
+                                        ctx.dedup_hard_links,
+                                        false, 0,
+                                    );
                                 unique_sum = unique_sum.saturating_add(sub_unique);
                                 for (k, v) in sub_hardlinks {
                                     hardlinks.entry(k).or_insert(v);
@@ -349,7 +406,13 @@ fn start_size_computation(
 
 /// Recursively compute the total size of all files under `dir`.
 /// Returns (unique_sum, hardlinks) — split by nlink for cascade dedup.
-fn recursive_dir_size(dir: &Path, cancel: &AtomicBool, dedup: bool) -> (u64, InodeMap) {
+fn recursive_dir_size(
+    dir: &Path,
+    cancel: &AtomicBool,
+    dedup: bool,
+    one_file_system: bool,
+    root_dev: u64,
+) -> (u64, InodeMap) {
     let mut unique_sum: u64 = 0;
     let mut hardlinks = InodeMap::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -368,7 +431,15 @@ fn recursive_dir_size(dir: &Path, cancel: &AtomicBool, dedup: bool) -> (u64, Ino
                 Err(_) => continue,
             };
             if ft.is_dir() {
-                stack.push(entry.path());
+                if one_file_system {
+                    if let Ok(meta) = std::fs::metadata(&entry.path()) {
+                        if is_same_device(&meta, root_dev) {
+                            stack.push(entry.path());
+                        }
+                    }
+                } else {
+                    stack.push(entry.path());
+                }
             } else if ft.is_file() {
                 if let Ok(meta) = entry.metadata() {
                     let (size, inode_key) = classify_file(&meta, dedup);
@@ -527,8 +598,17 @@ async fn main() -> Result<()> {
     walk_config.max_depth = cli.depth;
     walk_config.show_hidden = cli.hidden;
 
-    let tree = core::fs::build_tree(&root, &walk_config)?;
     let user_config = config::AppConfig::load();
+
+    // Apply persisted settings; CLI flags override.
+    walk_config.dedup_hard_links = user_config.dedup_hard_links;
+    walk_config.one_file_system = if cli.one_file_system {
+        true // CLI -x forces it on
+    } else {
+        user_config.one_file_system
+    };
+
+    let tree = core::fs::build_tree(&root, &walk_config)?;
     let mut state = AppState::new(root, tree, user_config);
     state.walk_config = walk_config;
     state.needs_size_recompute = true;
@@ -583,6 +663,7 @@ async fn main() -> Result<()> {
                     frame.render_widget(
                         popup::SettingsPopup {
                             selected: state.settings_selected,
+                            walk_config: &state.walk_config,
                         },
                         frame.area(),
                     );

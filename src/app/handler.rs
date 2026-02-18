@@ -12,7 +12,11 @@ use super::state::{ActiveView, AppState};
 use crate::ui::tree_widget::{TreeRow, TreeWidget};
 
 /// Menu items shown in the settings popup.
-pub const SETTINGS_ITEMS: &[&str] = &["Controls"];
+pub const SETTINGS_ITEMS: &[&str] = &[
+    "Controls",
+    "Dedup Hard Links",
+    "One File System",
+];
 
 /// Total selectable rows in the controls submenu (actions + "Reset").
 pub fn controls_item_count() -> usize {
@@ -192,10 +196,29 @@ fn handle_settings_key(state: &mut AppState, key: KeyEvent) {
                 state.settings_selected += 1;
             }
         }
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-            if state.settings_selected == 0 {
-                state.active_view = ActiveView::ControlsSubmenu;
-                state.controls_selected = 0;
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+            match state.settings_selected {
+                0 => {
+                    // Controls submenu.
+                    state.active_view = ActiveView::ControlsSubmenu;
+                    state.controls_selected = 0;
+                }
+                1 => {
+                    // Toggle hard-link dedup.
+                    state.walk_config.dedup_hard_links = !state.walk_config.dedup_hard_links;
+                    state.config.dedup_hard_links = state.walk_config.dedup_hard_links;
+                    let _ = state.config.save();
+                    state.dir_local_sums.clear();
+                    state.needs_size_recompute = true;
+                }
+                2 => {
+                    // Toggle one-file-system.
+                    state.walk_config.one_file_system = !state.walk_config.one_file_system;
+                    state.config.one_file_system = state.walk_config.one_file_system;
+                    let _ = state.config.save();
+                    rebuild_tree(state);
+                }
+                _ => {}
             }
         }
         _ => {}

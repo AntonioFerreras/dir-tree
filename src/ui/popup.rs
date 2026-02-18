@@ -10,17 +10,20 @@ use ratatui::{
 
 use crate::app::handler::SETTINGS_ITEMS;
 use crate::config::{Action, AppConfig};
+use crate::core::fs::WalkConfig;
 
 // ───────────────────────────────────────── settings popup ────
 
 /// Settings menu popup overlay.
-pub struct SettingsPopup {
+pub struct SettingsPopup<'a> {
     pub selected: usize,
+    pub walk_config: &'a WalkConfig,
 }
 
-impl Widget for SettingsPopup {
+impl<'a> Widget for SettingsPopup<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let popup = centered_fixed(35, 7, area);
+        let height = (SETTINGS_ITEMS.len() as u16) + 6;
+        let popup = centered_fixed(40, height, area);
         Clear.render(popup, buf);
 
         let block = Block::default()
@@ -51,14 +54,38 @@ impl Widget for SettingsPopup {
             } else {
                 ("   ", Style::default().fg(Color::White))
             };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}{item}"),
-                style,
-            )));
+
+            // For toggle items, show the current state.
+            let suffix = match i {
+                1 => {
+                    if self.walk_config.dedup_hard_links { "  [ON]" } else { "  [OFF]" }
+                }
+                2 => {
+                    if self.walk_config.one_file_system { "  [ON]" } else { "  [OFF]" }
+                }
+                _ => "",
+            };
+            let toggle_style = if suffix.contains("ON") {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            if suffix.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{item}"),
+                    style,
+                )));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{item}"), style),
+                    Span::styled(suffix, toggle_style),
+                ]));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "  Esc close",
+            "  Enter/Space: toggle  Esc: close",
             Style::default().fg(Color::DarkGray),
         )));
 

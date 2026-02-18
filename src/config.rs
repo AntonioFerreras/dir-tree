@@ -231,9 +231,13 @@ impl KeyBind {
 
 // ───────────────────────────────────────── config ────────────
 
-/// Application configuration — currently just keybindings.
+/// Application configuration — keybindings and walk settings.
 pub struct AppConfig {
     pub bindings: HashMap<Action, Vec<KeyBind>>,
+    /// Deduplicate hard links in size computation.
+    pub dedup_hard_links: bool,
+    /// Stay on the same filesystem (don't cross mount points).
+    pub one_file_system: bool,
 }
 
 impl AppConfig {
@@ -330,13 +334,18 @@ impl AppConfig {
         let path = config_path();
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
+                let (bindings, dedup, ofs) = Self::parse_config(&contents);
                 return Self {
-                    bindings: Self::parse_config(&contents),
+                    bindings,
+                    dedup_hard_links: dedup,
+                    one_file_system: ofs,
                 };
             }
         }
         Self {
             bindings: Self::default_bindings(),
+            dedup_hard_links: true,
+            one_file_system: false,
         }
     }
 
@@ -350,8 +359,10 @@ impl AppConfig {
         Ok(())
     }
 
-    fn parse_config(s: &str) -> HashMap<Action, Vec<KeyBind>> {
+    fn parse_config(s: &str) -> (HashMap<Action, Vec<KeyBind>>, bool, bool) {
         let mut bindings = Self::default_bindings();
+        let mut dedup_hard_links = true;
+        let mut one_file_system = false;
 
         for line in s.lines() {
             let line = line.trim();
@@ -363,6 +374,19 @@ impl AppConfig {
             };
             let key = key.trim();
             let value = value.trim();
+
+            // Walk settings.
+            match key {
+                "dedup_hard_links" => {
+                    dedup_hard_links = value == "true";
+                    continue;
+                }
+                "one_file_system" => {
+                    one_file_system = value == "true";
+                    continue;
+                }
+                _ => {}
+            }
 
             let Some(action) = Action::from_config_key(key) else {
                 continue;
@@ -380,12 +404,18 @@ impl AppConfig {
             }
         }
 
-        bindings
+        (bindings, dedup_hard_links, one_file_system)
     }
 
     fn serialise(&self) -> String {
         let mut lines = vec![
-            "# dir-tree key bindings".to_string(),
+            "# dir-tree configuration".to_string(),
+            String::new(),
+            "# Walk settings".to_string(),
+            format!("dedup_hard_links = {}", self.dedup_hard_links),
+            format!("one_file_system = {}", self.one_file_system),
+            String::new(),
+            "# Key bindings".to_string(),
             "# Format: action = Key1, Key2, ...".to_string(),
             "# Modifiers: Ctrl+, Alt+, Shift+ (prefix)".to_string(),
             "# Special keys: Up, Down, Left, Right, Enter, Esc, Tab,".to_string(),

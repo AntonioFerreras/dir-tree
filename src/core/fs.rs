@@ -23,6 +23,9 @@ pub struct WalkConfig {
     /// apparent size is only counted once across the whole traversal.
     /// Matches default `du` behaviour; disable to match `du -l`.
     pub dedup_hard_links: bool,
+    /// Stay on the same filesystem as the root directory.
+    /// Equivalent to `du -x` / `--one-file-system`.
+    pub one_file_system: bool,
 }
 
 impl Default for WalkConfig {
@@ -32,6 +35,7 @@ impl Default for WalkConfig {
             respect_gitignore: true,
             show_hidden: false,
             dedup_hard_links: true,
+            one_file_system: false,
         }
     }
 }
@@ -92,6 +96,7 @@ pub fn build_tree(root: &Path, config: &WalkConfig) -> anyhow::Result<DirTree> {
         .max_depth(Some(config.max_depth))
         .hidden(!config.show_hidden)
         .git_ignore(config.respect_gitignore)
+        .same_file_system(config.one_file_system)
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 
@@ -163,6 +168,7 @@ pub fn expand_node(
         .max_depth(Some(1))
         .hidden(!config.show_hidden)
         .git_ignore(config.respect_gitignore)
+        .same_file_system(config.one_file_system)
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 

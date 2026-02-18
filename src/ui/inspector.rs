@@ -95,7 +95,22 @@ pub fn pinned_cards_geometry(
         };
     }
 
-    let max_scroll = pin_count.saturating_sub(1);
+    // Compute max_scroll: the largest scroll index where all cards from
+    // that index onward fit entirely within the available height.
+    let max_scroll = {
+        let mut cumulative = 0u16;
+        let mut first_fitting = pin_count; // will walk backwards
+        for i in (0..pin_count).rev() {
+            let h = card_height_for(&pinned[i]);
+            let needed = if cumulative == 0 { h } else { cumulative + CARD_GAP + h };
+            if needed > available_height {
+                break;
+            }
+            cumulative = needed;
+            first_fitting = i;
+        }
+        first_fitting
+    };
     let scroll = requested_scroll.min(max_scroll);
 
     let mut cards = Vec::new();

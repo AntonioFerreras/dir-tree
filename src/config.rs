@@ -355,8 +355,8 @@ impl AppConfig {
         }
     }
 
-    /// Short display of the first binding only (for the status bar).
-    fn short_binding(&self, action: Action) -> String {
+    /// Short display of the first binding only (for the status bar / hints).
+    pub fn short_binding(&self, action: Action) -> String {
         match self.bindings.get(&action) {
             Some(binds) if !binds.is_empty() => binds[0].display(),
             _ => "?".into(),

@@ -414,6 +414,8 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                         toggle_dir_with_click(state, *node_id);
                         state.last_left_click = Some((*node_id, now));
                     } else {
+                        // Clicking a non-dir file toggles its pin state.
+                        toggle_pin_for_node(state, *node_id);
                         state.last_left_click = None;
                     }
                 } else {
@@ -576,26 +578,25 @@ fn handle_inspector_click(state: &mut AppState, inspector_area: ratatui::layout:
     }
 }
 
-fn maybe_pin_selected_non_dir(state: &mut AppState) {
-    let Some(node_id) = selected_node_id(state) else {
-        return;
-    };
+/// Toggle pin state for a given node: unpin if already pinned, pin if not.
+fn toggle_pin_for_node(state: &mut AppState, node_id: NodeId) {
     if state.tree.get(node_id).meta.is_dir {
         return;
     }
     let path = state.tree.get(node_id).meta.path.clone();
 
+    // Already pinned → unpin it.
     if let Some((idx, _)) = state
         .pinned_inspector
         .iter()
         .enumerate()
         .find(|(_, info)| info.path == path)
     {
-        state.inspector_selected_pin = idx;
-        clamp_inspector_selection_and_scroll(state);
+        remove_pin_at(state, idx);
         return;
     }
 
+    // Not pinned → pin it.
     let mut info = crate::core::inspector::inspect_path(&path);
     if let Some(sz) = state.dir_sizes.get(&path).copied() {
         info.size_bytes = Some(sz);
@@ -605,6 +606,13 @@ fn maybe_pin_selected_non_dir(state: &mut AppState) {
     state.pinned_inspector.push(info);
     state.inspector_selected_pin = state.pinned_inspector.len().saturating_sub(1);
     clamp_inspector_selection_and_scroll(state);
+}
+
+fn maybe_pin_selected_non_dir(state: &mut AppState) {
+    let Some(node_id) = selected_node_id(state) else {
+        return;
+    };
+    toggle_pin_for_node(state, node_id);
 }
 
 fn remove_selected_pin(state: &mut AppState) {

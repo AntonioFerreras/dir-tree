@@ -166,9 +166,18 @@ async fn main() -> Result<()> {
                     Theme::border_style()
                 });
 
+            // Show pin hint only when nothing is pinned yet.
+            let pin_hint = if state.pinned_inspector.is_empty() {
+                let key = state.config.short_binding(crate::config::Action::Expand);
+                Some(format!("{key} to pin file on inspector"))
+            } else {
+                None
+            };
+
             let tree_widget = TreeWidget::new(&state.tree, &state.grouping_config)
                 .dir_sizes(&state.dir_sizes)
                 .file_sizes(&state.file_sizes)
+                .pin_hint(pin_hint)
                 .block(tree_block);
 
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);

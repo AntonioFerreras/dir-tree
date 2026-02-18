@@ -83,6 +83,8 @@ pub struct TreeWidget<'a> {
     dir_sizes: Option<&'a HashMap<PathBuf, u64>>,
     file_sizes: Option<&'a HashMap<PathBuf, u64>>,
     block: Option<Block<'a>>,
+    /// Optional hint shown on the selected non-dir row (e.g. "→ to pin").
+    pin_hint: Option<String>,
 }
 
 impl<'a> TreeWidget<'a> {
@@ -93,6 +95,7 @@ impl<'a> TreeWidget<'a> {
             dir_sizes: None,
             file_sizes: None,
             block: None,
+            pin_hint: None,
         }
     }
 
@@ -108,6 +111,13 @@ impl<'a> TreeWidget<'a> {
 
     pub fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
+        self
+    }
+
+    /// Set a hint string shown beside the selected non-directory file
+    /// (e.g. `"→ to pin file on inspector"`).
+    pub fn pin_hint(mut self, hint: Option<String>) -> Self {
+        self.pin_hint = hint;
         self
     }
 
@@ -254,13 +264,22 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                     }
 
                     // Hint on selected root: explain how to navigate above
-                    // the launch directory. Keep this at the very end so it
-                    // appears after the size text.
+                    // the launch directory.
                     if is_selected && *node_id == self.tree.root {
                         spans.push(Span::styled(
                             "  Collapse to see parent directory",
                             Theme::root_hint_style(),
                         ));
+                    }
+
+                    // Hint on selected non-dir file: explain pin action.
+                    if is_selected && !*is_dir {
+                        if let Some(ref hint) = self.pin_hint {
+                            spans.push(Span::styled(
+                                format!("  {hint}"),
+                                Theme::root_hint_style(),
+                            ));
+                        }
                     }
 
                     Line::from(spans)

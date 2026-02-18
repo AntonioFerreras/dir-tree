@@ -61,11 +61,13 @@ pub struct AppState {
     /// Cached per-directory local walk results from workers.  On expand, only
     /// the expanded dir's entry is invalidated — all others survive so we
     /// skip redundant I/O.
-    pub dir_local_sums: HashMap<PathBuf, crate::DirLocalResult>,
+    pub dir_local_sums: HashMap<PathBuf, crate::core::size::DirLocalResult>,
     /// Flag set by event handlers to trigger a background size recomputation.
     pub needs_size_recompute: bool,
     /// Monotonic generation id used to ignore stale background size updates.
     pub size_compute_generation: u64,
+    /// `true` while background size workers are still running.
+    pub scanning: bool,
 }
 
 impl AppState {
@@ -89,6 +91,7 @@ impl AppState {
             dir_local_sums: HashMap::new(),
             needs_size_recompute: false,
             size_compute_generation: 0,
+            scanning: false,
         }
     }
 }

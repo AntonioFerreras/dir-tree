@@ -11,11 +11,56 @@ use crate::core::tree::NodeId;
 use super::state::{ActiveView, AppState};
 use crate::ui::tree_widget::{TreeRow, TreeWidget};
 
-/// Menu items shown in the settings popup.
-pub const SETTINGS_ITEMS: &[&str] = &[
-    "Controls",
-    "Dedup Hard Links",
-    "One File System",
+/// A single item in the settings menu.
+pub enum SettingsItem {
+    /// Opens a submenu.
+    Submenu {
+        label: &'static str,
+        view: ActiveView,
+    },
+    /// Boolean toggle — reads/writes via accessors on `AppState`.
+    Toggle {
+        label: &'static str,
+        get: fn(&AppState) -> bool,
+        set: fn(&mut AppState, bool),
+    },
+}
+
+impl SettingsItem {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Submenu { label, .. } | Self::Toggle { label, .. } => label,
+        }
+    }
+}
+
+/// All items shown in the settings popup, in display order.
+pub static SETTINGS_ITEMS: &[SettingsItem] = &[
+    SettingsItem::Submenu {
+        label: "Controls",
+        view: ActiveView::ControlsSubmenu,
+    },
+    SettingsItem::Toggle {
+        label: "Dedup Hard Links",
+        get: |s| s.config.dedup_hard_links,
+        set: |s, v| {
+            s.config.dedup_hard_links = v;
+            let _ = s.config.save();
+            s.dir_local_sums.clear();
+            s.needs_size_recompute = true;
+        },
+    },
+    SettingsItem::Toggle {
+        label: "One File System",
+        get: |s| s.config.one_file_system,
+        set: |s, v| {
+            s.config.one_file_system = v;
+            s.walk_config.one_file_system = v;
+            let _ = s.config.save();
+            // Full rebuild needed since directory visibility changes.
+            rebuild_tree(s);
+        },
+    },
 ];
 
 /// Total selectable rows in the controls submenu (actions + "Reset").
@@ -197,28 +242,17 @@ fn handle_settings_key(state: &mut AppState, key: KeyEvent) {
             }
         }
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
-            match state.settings_selected {
-                0 => {
-                    // Controls submenu.
-                    state.active_view = ActiveView::ControlsSubmenu;
-                    state.controls_selected = 0;
+            if let Some(item) = SETTINGS_ITEMS.get(state.settings_selected) {
+                match item {
+                    SettingsItem::Submenu { view, .. } => {
+                        state.active_view = *view;
+                        state.controls_selected = 0;
+                    }
+                    SettingsItem::Toggle { get, set, .. } => {
+                        let current = get(state);
+                        set(state, !current);
+                    }
                 }
-                1 => {
-                    // Toggle hard-link dedup.
-                    state.walk_config.dedup_hard_links = !state.walk_config.dedup_hard_links;
-                    state.config.dedup_hard_links = state.walk_config.dedup_hard_links;
-                    let _ = state.config.save();
-                    state.dir_local_sums.clear();
-                    state.needs_size_recompute = true;
-                }
-                2 => {
-                    // Toggle one-file-system.
-                    state.walk_config.one_file_system = !state.walk_config.one_file_system;
-                    state.config.one_file_system = state.walk_config.one_file_system;
-                    let _ = state.config.save();
-                    rebuild_tree(state);
-                }
-                _ => {}
             }
         }
         _ => {}

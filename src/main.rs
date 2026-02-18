@@ -11,7 +11,7 @@ mod ui;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, stderr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,7 +35,7 @@ use crate::app::{
     state::{ActiveView, AppState},
 };
 use crate::shell::integration;
-use crate::ui::{layout::AppLayout, popup, theme::Theme, tree_widget::TreeWidget};
+use crate::ui::{layout::AppLayout, popup, spinner::ScanIndicator, theme::Theme, tree_widget::TreeWidget};
 
 // ───────────────────────────────────────── CLI ───────────────
 
@@ -69,19 +69,9 @@ struct Cli {
 
 // ───────────────────────────────────────── size computation ──
 
-/// Map of hard-linked inodes: (dev, ino) → apparent size.
-/// Only files with nlink > 1 land here; nlink == 1 files are summed directly.
-type InodeMap = HashMap<(u64, u64), u64>;
-
-/// Cached result from a directory's local walk.
-#[derive(Clone)]
-struct DirLocalResult {
-    /// Sum of apparent sizes for files with nlink == 1 (safely additive).
-    unique_sum: u64,
-    /// Hard-linked files: (dev, ino) → size.  Deduped within this subtree,
-    /// but may overlap with sibling directories — the cascade merges these.
-    hardlinks: InodeMap,
-}
+use crate::core::size::{
+    self, classify_file, get_dev, is_same_device, DirLocalResult, InodeMap,
+};
 
 #[derive(Debug)]
 enum SizeUpdate {
@@ -124,51 +114,6 @@ struct SizeComputeState {
     finished: HashSet<PathBuf>,
     /// Shared flag used to signal worker threads to stop early.
     cancel: Arc<AtomicBool>,
-}
-
-/// Check whether a directory should be descended into (mount boundary check).
-#[cfg(unix)]
-fn is_same_device(meta: &std::fs::Metadata, root_dev: u64) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    meta.dev() == root_dev
-}
-
-#[cfg(not(unix))]
-fn is_same_device(_meta: &std::fs::Metadata, _root_dev: u64) -> bool {
-    true // no device check on non-Unix
-}
-
-/// Get the device ID of a path.
-#[cfg(unix)]
-fn get_dev(path: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map(|m| m.dev()).unwrap_or(0)
-}
-
-#[cfg(not(unix))]
-fn get_dev(_path: &Path) -> u64 {
-    0
-}
-
-/// Classify a file as unique or hard-linked, returning `(size, is_hardlink, dev, ino)`.
-/// Files with nlink == 1 are unique and never need inode tracking.
-#[cfg(unix)]
-fn classify_file(meta: &std::fs::Metadata, dedup: bool) -> (u64, Option<(u64, u64)>) {
-    let size = meta.len();
-    if !dedup {
-        return (size, None);
-    }
-    use std::os::unix::fs::MetadataExt;
-    if meta.nlink() <= 1 {
-        (size, None) // unique — no inode tracking needed
-    } else {
-        (size, Some((meta.dev(), meta.ino())))
-    }
-}
-
-#[cfg(not(unix))]
-fn classify_file(meta: &std::fs::Metadata, _dedup: bool) -> (u64, Option<(u64, u64)>) {
-    (meta.len(), None)
 }
 
 fn start_size_computation(
@@ -246,7 +191,7 @@ fn start_size_computation(
     });
 
     let queue = Arc::new(Mutex::new(jobs));
-    let dedup_hard_links = state.walk_config.dedup_hard_links;
+    let dedup_hard_links = state.config.dedup_hard_links;
     let one_file_system = state.walk_config.one_file_system;
     let root_dev = get_dev(&state.cwd);
     let ctx = Arc::new(WorkerCtx {
@@ -339,7 +284,7 @@ fn start_size_computation(
                                 if let Ok(meta) = std::fs::metadata(&path) {
                                     if is_same_device(&meta, ctx.root_dev) {
                                         let (sub_unique, sub_hardlinks) =
-                                            recursive_dir_size(
+                                            size::recursive_dir_size(
                                                 &path, &cancel,
                                                 ctx.dedup_hard_links,
                                                 true, ctx.root_dev,
@@ -349,12 +294,10 @@ fn start_size_computation(
                                             hardlinks.entry(k).or_insert(v);
                                         }
                                     }
-                                    // else: different device — skip
                                 }
                             } else {
-                                // Cross mount points freely.
                                 let (sub_unique, sub_hardlinks) =
-                                    recursive_dir_size(
+                                    size::recursive_dir_size(
                                         &path, &cancel,
                                         ctx.dedup_hard_links,
                                         false, 0,
@@ -402,61 +345,6 @@ fn start_size_computation(
         finished: HashSet::new(),
         cancel,
     }
-}
-
-/// Recursively compute the total size of all files under `dir`.
-/// Returns (unique_sum, hardlinks) — split by nlink for cascade dedup.
-fn recursive_dir_size(
-    dir: &Path,
-    cancel: &AtomicBool,
-    dedup: bool,
-    one_file_system: bool,
-    root_dev: u64,
-) -> (u64, InodeMap) {
-    let mut unique_sum: u64 = 0;
-    let mut hardlinks = InodeMap::new();
-    let mut stack = vec![dir.to_path_buf()];
-
-    while let Some(current) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let entries = match std::fs::read_dir(&current) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                if one_file_system {
-                    if let Ok(meta) = std::fs::metadata(&entry.path()) {
-                        if is_same_device(&meta, root_dev) {
-                            stack.push(entry.path());
-                        }
-                    }
-                } else {
-                    stack.push(entry.path());
-                }
-            } else if ft.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    let (size, inode_key) = classify_file(&meta, dedup);
-                    match inode_key {
-                        None => unique_sum = unique_sum.saturating_add(size),
-                        Some(key) => { hardlinks.entry(key).or_insert(size); }
-                    }
-                }
-            } else if ft.is_symlink() {
-                if let Ok(meta) = std::fs::symlink_metadata(&entry.path()) {
-                    unique_sum = unique_sum.saturating_add(meta.len());
-                }
-            }
-        }
-    }
-
-    (unique_sum, hardlinks)
 }
 
 /// Process a single size update message.  Returns `true` if a `DirLocalDone`
@@ -601,7 +489,6 @@ async fn main() -> Result<()> {
     let user_config = config::AppConfig::load();
 
     // Apply persisted settings; CLI flags override.
-    walk_config.dedup_hard_links = user_config.dedup_hard_links;
     walk_config.one_file_system = if cli.one_file_system {
         true // CLI -x forces it on
     } else {
@@ -628,6 +515,7 @@ async fn main() -> Result<()> {
     let mut events = spawn_event_reader(Duration::from_millis(100));
     let (size_tx, mut size_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, SizeUpdate)>();
     let mut size_compute: Option<SizeComputeState> = None;
+    let mut tick_count: u64 = 0;
 
     // ── event loop ────────────────────────────────────────────
     loop {
@@ -650,6 +538,15 @@ async fn main() -> Result<()> {
 
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);
 
+            // Scanning indicator (top-right of tree area, overlays the border).
+            frame.render_widget(
+                ScanIndicator {
+                    visible: state.scanning,
+                    tick: tick_count,
+                },
+                layout.tree_area,
+            );
+
             let hint = state.config.status_bar_hint();
             let status_text = match state.active_view {
                 ActiveView::Tree => state.status_message.as_deref().unwrap_or(&hint),
@@ -663,7 +560,7 @@ async fn main() -> Result<()> {
                     frame.render_widget(
                         popup::SettingsPopup {
                             selected: state.settings_selected,
-                            walk_config: &state.walk_config,
+                            state: &state,
                         },
                         frame.area(),
                     );
@@ -694,6 +591,7 @@ async fn main() -> Result<()> {
             }
             size_compute = Some(start_size_computation(&mut state, &size_tx));
             if let Some(ref mut compute) = size_compute {
+                state.scanning = compute.remaining_workers > 0;
                 finalize_ready_dirs(&mut state, compute);
             }
         }
@@ -706,7 +604,9 @@ async fn main() -> Result<()> {
                     AppEvent::Key(k) => handler::handle_key(&mut state, k),
                     AppEvent::Mouse(m) => handler::handle_mouse(&mut state, m),
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::Tick => {}
+                    AppEvent::Tick => {
+                        tick_count = tick_count.wrapping_add(1);
+                    }
                 }
             }
 
@@ -731,6 +631,11 @@ async fn main() -> Result<()> {
                     if let Some(ref mut compute) = size_compute {
                         finalize_ready_dirs(&mut state, compute);
                     }
+                }
+
+                // Update scanning flag.
+                if let Some(ref compute) = size_compute {
+                    state.scanning = compute.remaining_workers > 0;
                 }
             }
         }

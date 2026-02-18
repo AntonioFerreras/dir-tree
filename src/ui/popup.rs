@@ -8,16 +8,16 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::app::handler::SETTINGS_ITEMS;
+use crate::app::handler::{SettingsItem, SETTINGS_ITEMS};
+use crate::app::state::AppState;
 use crate::config::{Action, AppConfig};
-use crate::core::fs::WalkConfig;
 
 // ───────────────────────────────────────── settings popup ────
 
 /// Settings menu popup overlay.
 pub struct SettingsPopup<'a> {
     pub selected: usize,
-    pub walk_config: &'a WalkConfig,
+    pub state: &'a AppState,
 }
 
 impl<'a> Widget for SettingsPopup<'a> {
@@ -43,7 +43,7 @@ impl<'a> Widget for SettingsPopup<'a> {
         let mut lines = Vec::new();
         lines.push(Line::raw(""));
         for (i, item) in SETTINGS_ITEMS.iter().enumerate() {
-            let (prefix, style) = if i == self.selected {
+            let (prefix, base_style) = if i == self.selected {
                 (
                     " ▸ ",
                     Style::default()
@@ -55,32 +55,28 @@ impl<'a> Widget for SettingsPopup<'a> {
                 ("   ", Style::default().fg(Color::White))
             };
 
-            // For toggle items, show the current state.
-            let suffix = match i {
-                1 => {
-                    if self.walk_config.dedup_hard_links { "  [ON]" } else { "  [OFF]" }
-                }
-                2 => {
-                    if self.walk_config.one_file_system { "  [ON]" } else { "  [OFF]" }
-                }
-                _ => "",
-            };
-            let toggle_style = if suffix.contains("ON") {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+            let label = item.label();
 
-            if suffix.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix}{item}"),
-                    style,
-                )));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{item}"), style),
-                    Span::styled(suffix, toggle_style),
-                ]));
+            match item {
+                SettingsItem::Submenu { .. } => {
+                    lines.push(Line::from(Span::styled(
+                        format!("{prefix}{label}"),
+                        base_style,
+                    )));
+                }
+                SettingsItem::Toggle { get, .. } => {
+                    let on = get(self.state);
+                    let suffix = if on { "  [ON]" } else { "  [OFF]" };
+                    let toggle_style = if on {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{prefix}{label}"), base_style),
+                        Span::styled(suffix, toggle_style),
+                    ]));
+                }
             }
         }
         lines.push(Line::raw(""));

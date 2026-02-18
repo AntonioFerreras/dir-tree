@@ -5,6 +5,7 @@
 
 pub mod layout;
 pub mod popup;
+pub mod spinner;
 pub mod theme;
 pub mod tree_widget;
 

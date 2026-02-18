@@ -19,10 +19,6 @@ pub struct WalkConfig {
     pub respect_gitignore: bool,
     /// Show hidden (dot-prefixed) entries.
     pub show_hidden: bool,
-    /// Deduplicate hard links (inode-based) so a hard-linked file's
-    /// apparent size is only counted once across the whole traversal.
-    /// Matches default `du` behaviour; disable to match `du -l`.
-    pub dedup_hard_links: bool,
     /// Stay on the same filesystem as the root directory.
     /// Equivalent to `du -x` / `--one-file-system`.
     pub one_file_system: bool,
@@ -34,7 +30,6 @@ impl Default for WalkConfig {
             max_depth: 3,
             respect_gitignore: true,
             show_hidden: false,
-            dedup_hard_links: true,
             one_file_system: false,
         }
     }

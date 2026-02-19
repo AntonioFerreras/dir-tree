@@ -24,6 +24,8 @@ pub enum ActiveView {
     Tree,
     SettingsMenu,
     ControlsSubmenu,
+    /// Full-screen image lightbox overlay.
+    Lightbox,
 }
 
 /// Which main pane currently owns keyboard focus.
@@ -108,6 +110,10 @@ pub struct AppState {
     pub image_cache: HashMap<PathBuf, Arc<image::RgbaImage>>,
     /// Paths currently being decoded on background threads.
     pub image_decoding: HashSet<PathBuf>,
+    /// Index of the image currently shown in the lightbox (into `pinned_inspector`).
+    pub lightbox_index: usize,
+    /// Hit zones from the last lightbox render (for mouse click dispatch).
+    pub lightbox_hit_zones: Option<crate::ui::lightbox::LightboxHitZones>,
 }
 
 impl AppState {
@@ -145,6 +151,8 @@ impl AppState {
             pin_scroll_anim: crate::ui::smooth_scroll::SmoothScroll::new(0.35),
             image_cache: HashMap::new(),
             image_decoding: HashSet::new(),
+            lightbox_index: 0,
+            lightbox_hit_zones: None,
         }
     }
 }

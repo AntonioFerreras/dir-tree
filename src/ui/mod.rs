@@ -5,6 +5,7 @@
 
 pub mod inspector;
 pub mod layout;
+pub mod lightbox;
 pub mod popup;
 pub mod smooth_scroll;
 pub mod spinner;

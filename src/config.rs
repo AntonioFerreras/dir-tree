@@ -285,6 +285,8 @@ pub struct AppConfig {
     pub panel_layout: PanelLayoutMode,
     /// Split between tree and inspector in percent (10..=90).
     pub panel_split_pct: u16,
+    /// Pinned file paths (persisted between sessions).
+    pub pinned_paths: Vec<String>,
 }
 
 impl AppConfig {
@@ -381,7 +383,7 @@ impl AppConfig {
         let path = config_path();
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                let (bindings, dedup, ofs, dclick_ms, panel_layout, panel_split_pct) =
+                let (bindings, dedup, ofs, dclick_ms, panel_layout, panel_split_pct, pinned) =
                     Self::parse_config(&contents);
                 return Self {
                     bindings,
@@ -390,6 +392,7 @@ impl AppConfig {
                     double_click_ms: dclick_ms,
                     panel_layout,
                     panel_split_pct,
+                    pinned_paths: pinned,
                 };
             }
         }
@@ -400,6 +403,7 @@ impl AppConfig {
             double_click_ms: 250,
             panel_layout: PanelLayoutMode::TreeLeft,
             panel_split_pct: 60,
+            pinned_paths: Vec::new(),
         }
     }
 
@@ -422,6 +426,7 @@ impl AppConfig {
         u64,
         PanelLayoutMode,
         u16,
+        Vec<String>,
     ) {
         let mut bindings = Self::default_bindings();
         let mut dedup_hard_links = true;
@@ -429,10 +434,32 @@ impl AppConfig {
         let mut double_click_ms = 250;
         let mut panel_layout = PanelLayoutMode::TreeLeft;
         let mut panel_split_pct: u16 = 60;
+        let mut pinned_paths: Vec<String> = Vec::new();
+        let mut in_pinned_section = false;
 
         for line in s.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+
+            // Detect [pinned] section header.
+            if line == "[pinned]" {
+                in_pinned_section = true;
+                continue;
+            }
+            // Any other section header ends the pinned section.
+            if line.starts_with('[') {
+                in_pinned_section = false;
+                continue;
+            }
+
+            if in_pinned_section {
+                // Each line in [pinned] is a file path.
+                if !line.is_empty() && !line.starts_with('#') {
+                    pinned_paths.push(line.to_string());
+                }
+                continue;
+            }
+
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -453,7 +480,6 @@ impl AppConfig {
                 }
                 "double_click_ms" => {
                     if let Ok(v) = value.parse::<u64>() {
-                        // Keep this bounded for predictable UX.
                         double_click_ms = v.clamp(100, 2000);
                     }
                     continue;
@@ -496,6 +522,7 @@ impl AppConfig {
             double_click_ms,
             panel_layout,
             panel_split_pct,
+            pinned_paths,
         )
     }
 
@@ -525,6 +552,17 @@ impl AppConfig {
             }
         }
         lines.push(String::new());
+
+        // Pinned files section.
+        if !self.pinned_paths.is_empty() {
+            lines.push("[pinned]".to_string());
+            lines.push("# Pinned file paths (one per line, restored on startup)".to_string());
+            for p in &self.pinned_paths {
+                lines.push(p.clone());
+            }
+            lines.push(String::new());
+        }
+
         lines.join("\n")
     }
 }

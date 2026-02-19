@@ -38,6 +38,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) {
                 handle_controls_key(state, key);
             }
         }
+        ActiveView::Lightbox => handle_lightbox_key(state, key),
     }
 }
 
@@ -49,6 +50,10 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
             PaneFocus::Tree => PaneFocus::Inspector,
             PaneFocus::Inspector => PaneFocus::Tree,
         };
+        // When tabbing into inspector, reveal the selected pinned file in tree.
+        if state.pane_focus == PaneFocus::Inspector {
+            reveal_selected_pin_in_tree(state);
+        }
         return;
     }
 
@@ -353,6 +358,10 @@ fn handle_rebind_key(state: &mut AppState, key: KeyEvent) {
 
 /// Process a mouse event.
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
+    if state.active_view == ActiveView::Lightbox {
+        handle_lightbox_mouse(state, mouse);
+        return;
+    }
     if state.active_view != ActiveView::Tree {
         return;
     }
@@ -395,25 +404,27 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
             if clicked_row < rows.len() {
                 state.tree_state.selected = clicked_row;
 
+                let now = Instant::now();
+                let is_repeat_click = |state: &AppState, nid: NodeId| -> bool {
+                    state
+                        .last_left_click
+                        .as_ref()
+                        .map(|(last_id, at)| {
+                            *last_id == nid
+                                && now.duration_since(*at)
+                                    <= std::time::Duration::from_millis(
+                                        state.config.double_click_ms,
+                                    )
+                        })
+                        .unwrap_or(false)
+                };
+
                 if let Some(TreeRow::Node {
                     node_id, is_dir, ..
                 }) = rows.get(clicked_row)
                 {
                     if *is_dir {
-                        let now = Instant::now();
-                        let is_double_click = state
-                            .last_left_click
-                            .as_ref()
-                            .map(|(last_id, at)| {
-                                *last_id == *node_id
-                                    && now.duration_since(*at)
-                                        <= std::time::Duration::from_millis(
-                                            state.config.double_click_ms,
-                                        )
-                            })
-                            .unwrap_or(false);
-
-                        if is_double_click {
+                        if is_repeat_click(state, *node_id) {
                             let node = state.tree.get(*node_id);
                             state.selected_dir = Some(node.meta.path.clone());
                             state.should_quit = true;
@@ -424,9 +435,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                         toggle_dir_with_click(state, *node_id);
                         state.last_left_click = Some((*node_id, now));
                     } else {
-                        // Clicking a non-dir file toggles its pin state.
-                        toggle_pin_for_node(state, *node_id);
-                        state.last_left_click = None;
+                        // Second click on the same file toggles its pin.
+                        if is_repeat_click(state, *node_id) {
+                            toggle_pin_for_node(state, *node_id);
+                            state.last_left_click = None;
+                        } else {
+                            state.last_left_click = Some((*node_id, now));
+                        }
                     }
                 } else if let Some(TreeRow::Group { group_key, .. }) =
                     rows.get(clicked_row)
@@ -478,7 +493,213 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
     }
 }
 
+// ── Lightbox ────────────────────────────────────────────────────
+
+fn handle_lightbox_key(state: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => {
+            state.active_view = ActiveView::Tree;
+        }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
+            lightbox_prev(state);
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
+            lightbox_next(state);
+        }
+        KeyCode::Enter => {
+            state.active_view = ActiveView::Tree;
+        }
+        _ => {}
+    }
+}
+
+fn handle_lightbox_mouse(state: &mut AppState, mouse: MouseEvent) {
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some(zones) = state.lightbox_hit_zones {
+            if point_in_rect(zones.close_rect, mouse.column, mouse.row) {
+                state.active_view = ActiveView::Tree;
+                return;
+            }
+            if point_in_rect(zones.prev_rect, mouse.column, mouse.row) {
+                lightbox_prev(state);
+                return;
+            }
+            if point_in_rect(zones.next_rect, mouse.column, mouse.row) {
+                lightbox_next(state);
+                return;
+            }
+        }
+    }
+}
+
+/// Navigate to the previous pinned image in the lightbox.
+fn lightbox_prev(state: &mut AppState) {
+    let image_indices: Vec<usize> = state
+        .pinned_inspector
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_image())
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(pos) = image_indices.iter().position(|&i| i == state.lightbox_index) {
+        if pos > 0 {
+            state.lightbox_index = image_indices[pos - 1];
+        }
+    }
+}
+
+/// Navigate to the next pinned image in the lightbox.
+fn lightbox_next(state: &mut AppState) {
+    let image_indices: Vec<usize> = state
+        .pinned_inspector
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_image())
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(pos) = image_indices.iter().position(|&i| i == state.lightbox_index) {
+        if pos + 1 < image_indices.len() {
+            state.lightbox_index = image_indices[pos + 1];
+        }
+    }
+}
+
 // ── helpers ─────────────────────────────────────────────────────
+
+/// Reveal the currently selected pinned file in the tree panel.
+fn reveal_selected_pin_in_tree(state: &mut AppState) {
+    if state.pinned_inspector.is_empty() {
+        return;
+    }
+    let idx = state.inspector_selected_pin.min(state.pinned_inspector.len().saturating_sub(1));
+    let target_path = state.pinned_inspector[idx].path.clone();
+    reveal_path_in_tree(state, &target_path);
+}
+
+/// Ensure `target` is visible in the tree by:
+/// 1. Moving the root upward if the target is outside the current tree.
+/// 2. Expanding each ancestor directory along the path.
+/// 3. Selecting the target's row in the tree widget.
+fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
+    // Step 1: If the file is not under the current cwd, move root up.
+    if !target.starts_with(&state.cwd) {
+        // Find the deepest common ancestor.
+        let mut ancestor = target.to_path_buf();
+        loop {
+            if let Some(parent) = ancestor.parent() {
+                ancestor = parent.to_path_buf();
+                if state.cwd.starts_with(&ancestor) && target.starts_with(&ancestor) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        // Rebuild tree from the common ancestor.
+        if let Ok(tree) = fs::build_tree(&ancestor, &state.walk_config, state.config.one_file_system) {
+            state.cwd = ancestor;
+            state.tree = tree;
+            state.tree_state.selected = 0;
+            state.tree_state.offset = 0;
+            state.dir_sizes.clear();
+            state.file_sizes.clear();
+            state.dir_local_sums.clear();
+            state.needs_size_recompute = true;
+        } else {
+            return;
+        }
+    }
+
+    // Step 2: Walk from cwd to the target, expanding each directory.
+    // Collect the chain of ancestor paths between cwd and the target's parent.
+    let mut dirs_to_expand = Vec::new();
+    {
+        let mut p = target.parent();
+        while let Some(dir) = p {
+            if dir == state.cwd.as_path() {
+                break;
+            }
+            dirs_to_expand.push(dir.to_path_buf());
+            p = dir.parent();
+        }
+        dirs_to_expand.reverse(); // from shallowest to deepest
+    }
+
+    for dir_path in &dirs_to_expand {
+        // Find the node with this path.
+        let node_id = state
+            .tree
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n.meta.path == *dir_path)
+            .map(|(i, _)| i);
+
+        if let Some(nid) = node_id {
+            // Expand it (lazy-load children if needed).
+            let _ = fs::expand_node(
+                &mut state.tree,
+                nid,
+                &state.walk_config,
+                state.config.one_file_system,
+            );
+            state.tree.get_mut(nid).expanded = true;
+            let path = state.tree.get(nid).meta.path.clone();
+            state.dir_local_sums.remove(&path);
+        }
+    }
+    state.needs_size_recompute = true;
+
+    // Step 3: If the file is inside a collapsed group, expand that group.
+    // Build rows and check: if the target isn't found as a Node row, look
+    // for a Group whose members include it and expand that group.
+    loop {
+        let rows = build_rows(state);
+        // Try to find the target as a visible Node row.
+        let found = rows.iter().enumerate().find(|(_, row)| {
+            if let TreeRow::Node { node_id, .. } = row {
+                state.tree.get(*node_id).meta.path == *target
+            } else {
+                false
+            }
+        });
+        if let Some((i, _)) = found {
+            state.tree_state.selected = i;
+            break;
+        }
+
+        // Not found — look for a Group that contains it as a member.
+        let group_to_expand = rows.iter().find_map(|row| {
+            if let TreeRow::Group {
+                group_key,
+                members,
+                expanded,
+                ..
+            } = row
+            {
+                if !expanded {
+                    let has_member = members.iter().any(|&mid| {
+                        state.tree.get(mid).meta.path == *target
+                    });
+                    if has_member {
+                        return Some(group_key.clone());
+                    }
+                }
+                None
+            } else {
+                None
+            }
+        });
+
+        if let Some(key) = group_to_expand {
+            state.expanded_groups.insert(key);
+            // Loop again — now the group is expanded and the file should be visible.
+        } else {
+            // Neither a visible node nor inside any group — give up.
+            break;
+        }
+    }
+}
 
 fn build_rows(state: &AppState) -> Vec<TreeRow> {
     TreeWidget::new(&state.tree, &state.grouping_config)
@@ -561,6 +782,7 @@ fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
             if state.inspector_selected_pin > 0 {
                 state.inspector_selected_pin -= 1;
                 clamp_inspector_selection_and_scroll(state);
+                reveal_selected_pin_in_tree(state);
             }
             true
         }
@@ -570,6 +792,7 @@ fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
             {
                 state.inspector_selected_pin += 1;
                 clamp_inspector_selection_and_scroll(state);
+                reveal_selected_pin_in_tree(state);
             }
             true
         }
@@ -577,6 +800,7 @@ fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
             if !state.pinned_inspector.is_empty() {
                 state.inspector_selected_pin = 0;
                 clamp_inspector_selection_and_scroll(state);
+                reveal_selected_pin_in_tree(state);
             }
             true
         }
@@ -584,6 +808,20 @@ fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
             if !state.pinned_inspector.is_empty() {
                 state.inspector_selected_pin = state.pinned_inspector.len() - 1;
                 clamp_inspector_selection_and_scroll(state);
+                reveal_selected_pin_in_tree(state);
+            }
+            true
+        }
+        KeyCode::Enter => {
+            // Open lightbox if the selected pinned card is an image.
+            if !state.pinned_inspector.is_empty() {
+                let idx = state.inspector_selected_pin;
+                if idx < state.pinned_inspector.len()
+                    && state.pinned_inspector[idx].is_image()
+                {
+                    state.lightbox_index = idx;
+                    state.active_view = ActiveView::Lightbox;
+                }
             }
             true
         }
@@ -614,9 +852,20 @@ fn handle_inspector_click(state: &mut AppState, inspector_area: ratatui::layout:
         if point_in_rect(card.card_rect, col, row) {
             state.inspector_selected_pin = card.pin_index;
             clamp_inspector_selection_and_scroll(state);
+            reveal_selected_pin_in_tree(state);
             return;
         }
     }
+}
+
+/// Sync pinned paths from `pinned_inspector` to `config.pinned_paths` and persist.
+fn persist_pins(state: &mut AppState) {
+    state.config.pinned_paths = state
+        .pinned_inspector
+        .iter()
+        .map(|info| info.path.display().to_string())
+        .collect();
+    let _ = state.config.save();
 }
 
 /// Toggle pin state for a given node: unpin if already pinned, pin if not.
@@ -647,6 +896,7 @@ fn toggle_pin_for_node(state: &mut AppState, node_id: NodeId) {
     state.pinned_inspector.push(info);
     state.inspector_selected_pin = state.pinned_inspector.len().saturating_sub(1);
     clamp_inspector_selection_and_scroll(state);
+    persist_pins(state);
 }
 
 fn maybe_pin_selected_non_dir(state: &mut AppState) {
@@ -677,6 +927,7 @@ fn remove_pin_at(state: &mut AppState, index: usize) {
     } else {
         clamp_inspector_selection_and_scroll(state);
     }
+    persist_pins(state);
 }
 
 fn inspector_geom(state: &AppState) -> crate::ui::inspector::PinnedCardsGeometry {

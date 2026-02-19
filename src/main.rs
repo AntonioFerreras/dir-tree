@@ -112,9 +112,19 @@ async fn main() -> Result<()> {
     };
 
     let tree = core::fs::build_tree(&root, &walk_config, user_config.one_file_system)?;
+    let saved_pins = user_config.pinned_paths.clone();
     let mut state = AppState::new(root, tree, user_config);
     state.walk_config = walk_config;
     state.needs_size_recompute = true;
+
+    // Restore pinned files from last session (skip paths that no longer exist).
+    for path_str in &saved_pins {
+        let path = std::path::PathBuf::from(path_str);
+        if path.exists() {
+            let info = crate::core::inspector::inspect_path(&path);
+            state.pinned_inspector.push(info);
+        }
+    }
 
     // ── terminal setup ────────────────────────────────────────
     enable_raw_mode()?;
@@ -240,7 +250,7 @@ async fn main() -> Result<()> {
             let hint = state.config.status_bar_hint();
             let status_text = match state.active_view {
                 ActiveView::Tree => state.status_message.as_deref().unwrap_or(&hint),
-                ActiveView::SettingsMenu | ActiveView::ControlsSubmenu => "",
+                ActiveView::SettingsMenu | ActiveView::ControlsSubmenu | ActiveView::Lightbox => "",
             };
             let status = Paragraph::new(status_text).style(Theme::status_bar_style());
             frame.render_widget(status, layout.status_area);
@@ -264,6 +274,15 @@ async fn main() -> Result<()> {
                         },
                         frame.area(),
                     );
+                }
+                ActiveView::Lightbox => {
+                    let lw = crate::ui::lightbox::LightboxWidget {
+                        pinned: &state.pinned_inspector,
+                        current: state.lightbox_index,
+                        image_cache: &state.image_cache,
+                    };
+                    state.lightbox_hit_zones =
+                        Some(lw.render_and_hit(frame.area(), frame.buffer_mut()));
                 }
                 ActiveView::Tree => {}
             }

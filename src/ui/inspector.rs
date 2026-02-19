@@ -604,6 +604,11 @@ fn format_ts(unix_secs: u64) -> String {
 
 // ─── image preview (halfblock renderer) ─────────────────────────
 
+/// Public entry point so other modules (e.g. lightbox) can reuse the renderer.
+pub fn render_image_halfblocks_pub(thumb: &image::RgbaImage, area: Rect, buf: &mut Buffer) {
+    render_image_halfblocks(thumb, area, buf);
+}
+
 /// Render a pre-resized `RgbaImage` using Unicode `▀` half-blocks (2 pixels per cell).
 ///
 /// Aspect ratio is preserved: the image is fitted inside `area` and centred

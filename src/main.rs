@@ -133,9 +133,18 @@ async fn main() -> Result<()> {
     let mut size_compute: Option<SizeComputeState> = None;
     let mut tick_count: u64 = 0;
 
+    // Channel for background image decoding (decode + pre-resize off main thread).
+    let (img_tx, img_rx) = std::sync::mpsc::channel::<(PathBuf, image::RgbaImage)>();
+
     // ── event loop ────────────────────────────────────────────
     loop {
-        refresh_inspector(&mut state);
+        // Poll completed image decodes (non-blocking).
+        while let Ok((path, rgba)) = img_rx.try_recv() {
+            state.image_decoding.remove(&path);
+            state.image_cache.insert(path, std::sync::Arc::new(rgba));
+        }
+
+        refresh_inspector(&mut state, &img_tx);
 
         // ── draw first ─────────────────────────────────────────
         // Always render before doing any expensive work so the UI
@@ -347,11 +356,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn refresh_inspector(state: &mut AppState) {
+fn refresh_inspector(
+    state: &mut AppState,
+    img_tx: &std::sync::mpsc::Sender<(PathBuf, image::RgbaImage)>,
+) {
     let selected = handler::selected_node_path(state);
     if selected == state.inspector_path {
-        // Keep directory/file apparent size fresh even when selection stays put
-        // and async size workers are still updating maps.
         if let (Some(path), Some(info)) = (selected.as_ref(), state.inspector_info.as_mut()) {
             if let Some(sz) = state.dir_sizes.get(path).copied() {
                 info.size_bytes = Some(sz);
@@ -366,8 +376,7 @@ fn refresh_inspector(state: &mut AppState) {
                 pin.size_bytes = Some(sz);
             }
         }
-        // Ensure images are cached for current + pinned.
-        cache_images_if_needed(state);
+        enqueue_image_decodes(state, img_tx);
         return;
     }
     state.inspector_path = selected.clone();
@@ -388,31 +397,51 @@ fn refresh_inspector(state: &mut AppState) {
             pin.size_bytes = Some(sz);
         }
     }
-    cache_images_if_needed(state);
+    enqueue_image_decodes(state, img_tx);
 }
 
-/// Lazily decode images for the current selection and all pinned cards.
-/// Results are cached so each image is only decoded once.
-fn cache_images_if_needed(state: &mut AppState) {
-    // Collect paths that need decoding to avoid borrow issues.
-    let mut to_decode: Vec<std::path::PathBuf> = Vec::new();
+/// Maximum pixel dimension for cached image thumbnails.
+/// Terminal previews are at most ~80×60 pixels so 200 is generous headroom.
+const IMG_THUMB_MAX: u32 = 200;
+
+/// Spawn background threads to decode + pre-resize any images that are needed
+/// for the current selection or pinned cards but aren't yet cached.
+fn enqueue_image_decodes(
+    state: &mut AppState,
+    tx: &std::sync::mpsc::Sender<(PathBuf, image::RgbaImage)>,
+) {
+    let mut needed: Vec<PathBuf> = Vec::new();
 
     if let Some(info) = &state.inspector_info {
-        if info.is_image() && !state.image_cache.contains_key(&info.path) {
-            to_decode.push(info.path.clone());
+        if info.is_image()
+            && !state.image_cache.contains_key(&info.path)
+            && !state.image_decoding.contains(&info.path)
+        {
+            needed.push(info.path.clone());
         }
     }
     for pin in &state.pinned_inspector {
-        if pin.is_image() && !state.image_cache.contains_key(&pin.path) {
-            to_decode.push(pin.path.clone());
+        if pin.is_image()
+            && !state.image_cache.contains_key(&pin.path)
+            && !state.image_decoding.contains(&pin.path)
+        {
+            needed.push(pin.path.clone());
         }
     }
 
-    for path in to_decode {
-        if let Ok(img) = image::open(&path) {
-            state
-                .image_cache
-                .insert(path, std::sync::Arc::new(img));
-        }
+    for path in needed {
+        state.image_decoding.insert(path.clone());
+        let sender = tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(img) = image::open(&path) {
+                // Pre-resize so the cached bitmap is tiny and rendering is free.
+                let thumb = img.resize(
+                    IMG_THUMB_MAX,
+                    IMG_THUMB_MAX,
+                    image::imageops::FilterType::Triangle,
+                );
+                let _ = sender.send((path, thumb.to_rgba8()));
+            }
+        });
     }
 }

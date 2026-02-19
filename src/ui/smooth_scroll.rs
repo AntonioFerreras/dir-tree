@@ -29,12 +29,17 @@ impl SmoothScroll {
 
     /// Feed the current target and approximate card height.
     /// Detects when the target changed and injects displacement.
+    ///
+    /// The offset is capped at ±2× card height so rapid scrolling
+    /// doesn't accumulate an enormous displacement that plays back
+    /// after the user stops scrolling.
     pub fn set_target(&mut self, target: usize, approx_card_h: f64) {
         if target != self.prev_target {
             let delta = target as f64 - self.prev_target as f64;
-            // Positive delta → scrolling down → cards need to slide UP
-            // from below their target → start offset positive.
             self.row_offset += delta * approx_card_h;
+            // Cap so rapid-fire events don't build up a huge backlog.
+            let max = approx_card_h * 2.0;
+            self.row_offset = self.row_offset.clamp(-max, max);
             self.prev_target = target;
         }
     }

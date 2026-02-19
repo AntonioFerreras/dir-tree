@@ -102,8 +102,12 @@ pub struct AppState {
     /// Smooth-scroll animator for the pinned cards list.
     /// Smooth-scroll row-offset animator for the pinned cards list.
     pub pin_scroll_anim: crate::ui::smooth_scroll::SmoothScroll,
-    /// Cached decoded images for preview (path → DynamicImage).
-    pub image_cache: HashMap<PathBuf, Arc<image::DynamicImage>>,
+    /// Pre-resized image thumbnails for the inspector preview.
+    /// Images are decoded + resized on background threads and stored here
+    /// as small RGBA bitmaps so rendering is essentially free.
+    pub image_cache: HashMap<PathBuf, Arc<image::RgbaImage>>,
+    /// Paths currently being decoded on background threads.
+    pub image_decoding: HashSet<PathBuf>,
 }
 
 impl AppState {
@@ -140,6 +144,7 @@ impl AppState {
             inspector_pin_scroll: 0,
             pin_scroll_anim: crate::ui::smooth_scroll::SmoothScroll::new(0.35),
             image_cache: HashMap::new(),
+            image_decoding: HashSet::new(),
         }
     }
 }

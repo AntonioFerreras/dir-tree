@@ -160,7 +160,7 @@ pub struct InspectorWidget<'a> {
     pub scroll_row_offset: i16,
     pub selected_pin: Option<usize>,
     pub has_focus: bool,
-    pub image_cache: &'a HashMap<PathBuf, Arc<image::DynamicImage>>,
+    pub image_cache: &'a HashMap<PathBuf, Arc<image::RgbaImage>>,
 }
 
 impl<'a> Widget for InspectorWidget<'a> {
@@ -286,7 +286,7 @@ impl<'a> Widget for InspectorWidget<'a> {
 /// Render the "Current Selection" section and return its total height.
 fn render_current_section(
     info: Option<&InspectorInfo>,
-    image_cache: &HashMap<PathBuf, Arc<image::DynamicImage>>,
+    image_cache: &HashMap<PathBuf, Arc<image::RgbaImage>>,
     inner: Rect,
     buf: &mut Buffer,
 ) -> u16 {
@@ -370,7 +370,7 @@ fn render_animated_card(
     top_clipped: bool,
     bot_clipped: bool,
     content_skip: u16,
-    image_cache: &HashMap<PathBuf, Arc<image::DynamicImage>>,
+    image_cache: &HashMap<PathBuf, Arc<image::RgbaImage>>,
     buf: &mut Buffer,
 ) {
     let border_style = if is_selected {
@@ -604,38 +604,56 @@ fn format_ts(unix_secs: u64) -> String {
 
 // ─── image preview (halfblock renderer) ─────────────────────────
 
-/// Render a `DynamicImage` using Unicode `▀` half-blocks (2 pixels per cell).
-/// Works in any 24-bit-colour terminal, including over SSH.
-fn render_image_halfblocks(img: &image::DynamicImage, area: Rect, buf: &mut Buffer) {
+/// Render a pre-resized `RgbaImage` using Unicode `▀` half-blocks (2 pixels per cell).
+///
+/// Aspect ratio is preserved: the image is fitted inside `area` and centred
+/// horizontally.  Terminal cells are ~2× taller than wide, so each cell
+/// represents 1 pixel wide × 2 pixels tall; the fit calculation accounts
+/// for this.
+fn render_image_halfblocks(thumb: &image::RgbaImage, area: Rect, buf: &mut Buffer) {
     use image::imageops::FilterType;
     use ratatui::layout::Position;
 
-    if area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 || thumb.width() == 0 || thumb.height() == 0 {
         return;
     }
-    let tw = area.width as u32;
-    let th = (area.height as u32) * 2;
-    let resized = img.resize(tw, th, FilterType::Triangle);
-    let rgba = resized.to_rgba8();
+
+    // Available pixel budget: each column = 1 px wide, each row = 2 px tall.
+    let max_px_w = area.width as f64;
+    let max_px_h = (area.height as f64) * 2.0;
+
+    let src_w = thumb.width() as f64;
+    let src_h = thumb.height() as f64;
+
+    // Scale to fit within the pixel budget, preserving aspect ratio.
+    let scale = (max_px_w / src_w).min(max_px_h / src_h).min(1.0);
+    let fit_w = (src_w * scale).round().max(1.0) as u32;
+    let fit_h = (src_h * scale).round().max(1.0) as u32;
+
+    let rgba = image::imageops::resize(thumb, fit_w, fit_h, FilterType::Triangle);
     let (iw, ih) = (rgba.width(), rgba.height());
+
+    // Centre horizontally within the area.
+    let col_offset = (area.width.saturating_sub(iw as u16)) / 2;
 
     for row in 0..area.height {
         let yt = (row as u32) * 2;
         let yb = yt + 1;
-        for col in 0..area.width.min(iw as u16) {
-            let px = col as u32;
-            if px >= iw || yt >= ih {
-                continue;
-            }
-            let t = rgba.get_pixel(px, yt);
+        if yt >= ih {
+            break;
+        }
+        for col in 0..iw.min(area.width as u32) {
+            let t = rgba.get_pixel(col, yt);
             let fg = Color::Rgb(t[0], t[1], t[2]);
             let bg = if yb < ih {
-                let b = rgba.get_pixel(px, yb);
+                let b = rgba.get_pixel(col, yb);
                 Color::Rgb(b[0], b[1], b[2])
             } else {
                 Color::Reset
             };
-            if let Some(cell) = buf.cell_mut(Position::new(area.x + col, area.y + row)) {
+            if let Some(cell) =
+                buf.cell_mut(Position::new(area.x + col_offset + col as u16, area.y + row))
+            {
                 cell.set_char('▀').set_fg(fg).set_bg(bg);
             }
         }

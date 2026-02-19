@@ -3,7 +3,7 @@
 //! All mutable state lives here so that the rest of the app can be pure
 //! functions over `&AppState` (rendering) or `&mut AppState` (event handling).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -91,6 +91,8 @@ pub struct AppState {
     pub inspector_info: Option<InspectorInfo>,
     /// Which pane receives keyboard navigation in main tree view.
     pub pane_focus: PaneFocus,
+    /// Keys of file-groups that the user has expanded in the tree.
+    pub expanded_groups: HashSet<String>,
     /// Pinned inspector cards, created from tree entries.
     pub pinned_inspector: Vec<InspectorInfo>,
     /// Selected pinned card index.
@@ -132,6 +134,7 @@ impl AppState {
             inspector_path: None,
             inspector_info: None,
             pane_focus: PaneFocus::Tree,
+            expanded_groups: HashSet::new(),
             pinned_inspector: Vec::new(),
             inspector_selected_pin: 0,
             inspector_pin_scroll: 0,

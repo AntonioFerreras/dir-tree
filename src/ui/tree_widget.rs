@@ -1,7 +1,7 @@
 //! Custom Ratatui widget that renders a [`DirTree`] as an indented,
 //! collapsible tree with grouping support.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ratatui::{
@@ -70,7 +70,13 @@ pub enum TreeRow {
     },
     Group {
         depth: usize,
-        label: String, // e.g. "12 *.png files (340 KB)"
+        label: String,
+        /// Stable key used to track expanded state (e.g. "/path/to/parent:*.png").
+        group_key: String,
+        /// Whether this group is currently expanded to show its members.
+        expanded: bool,
+        /// Member node IDs (for expanding).
+        members: Vec<NodeId>,
     },
 }
 
@@ -85,6 +91,8 @@ pub struct TreeWidget<'a> {
     block: Option<Block<'a>>,
     /// Optional hint shown on the selected non-dir row (e.g. "→ to pin").
     pin_hint: Option<String>,
+    /// Keys of groups that are currently expanded.
+    expanded_groups: Option<&'a HashSet<String>>,
 }
 
 impl<'a> TreeWidget<'a> {
@@ -96,6 +104,7 @@ impl<'a> TreeWidget<'a> {
             file_sizes: None,
             block: None,
             pin_hint: None,
+            expanded_groups: None,
         }
     }
 
@@ -118,6 +127,12 @@ impl<'a> TreeWidget<'a> {
     /// (e.g. `"→ to pin file on inspector"`).
     pub fn pin_hint(mut self, hint: Option<String>) -> Self {
         self.pin_hint = hint;
+        self
+    }
+
+    /// Provide the set of currently expanded group keys.
+    pub fn expanded_groups(mut self, groups: &'a HashSet<String>) -> Self {
+        self.expanded_groups = Some(groups);
         self
     }
 
@@ -148,6 +163,7 @@ impl<'a> TreeWidget<'a> {
 
         // Apply grouping to this node's children.
         let grouped = grouping::group_children(self.tree, node_id, self.grouping_config, self.file_sizes);
+        let parent_path = node.meta.path.display().to_string();
 
         for entry in grouped {
             match entry {
@@ -158,13 +174,37 @@ impl<'a> TreeWidget<'a> {
                     label,
                     count,
                     total_size,
-                    ..
+                    members,
                 } => {
                     let depth = node.depth + 1;
+                    let group_key = format!("{parent_path}:{label}");
+                    let expanded = self
+                        .expanded_groups
+                        .map_or(false, |g| g.contains(&group_key));
+
                     rows.push(TreeRow::Group {
                         depth,
                         label: format!("{count} {label} files {}", grouping::human_size(total_size)),
+                        group_key,
+                        expanded,
+                        members: members.clone(),
                     });
+
+                    // When expanded, show each member indented one level deeper.
+                    if expanded {
+                        for &member_id in &members {
+                            let member = self.tree.get(member_id);
+                            rows.push(TreeRow::Node {
+                                node_id: member_id,
+                                depth: depth + 1,
+                                is_dir: false,
+                                is_symlink: member.meta.is_symlink,
+                                expanded: false,
+                                label: member.meta.name.clone(),
+                                symlink_target: member.meta.symlink_target.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -284,8 +324,14 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
 
                     Line::from(spans)
                 }
-                TreeRow::Group { depth, label } => {
+                TreeRow::Group {
+                    depth,
+                    label,
+                    expanded,
+                    ..
+                } => {
                     let indent = "  ".repeat(*depth);
+                    let icon = if *expanded { "− " } else { "+ " };
                     let style = if is_selected {
                         Theme::selected_style()
                     } else {
@@ -293,7 +339,7 @@ impl<'a> StatefulWidget for TreeWidget<'a> {
                     };
                     Line::from(vec![
                         Span::raw(indent),
-                        Span::styled(format!("  {label}"), style),
+                        Span::styled(format!("{icon}{label}"), style),
                     ])
                 }
             };

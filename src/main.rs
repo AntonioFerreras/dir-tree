@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
             let tree_widget = TreeWidget::new(&state.tree, &state.grouping_config)
                 .dir_sizes(&state.dir_sizes)
                 .file_sizes(&state.file_sizes)
+                .expanded_groups(&state.expanded_groups)
                 .pin_hint(pin_hint)
                 .block(tree_block);
 

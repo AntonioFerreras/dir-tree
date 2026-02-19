@@ -105,30 +105,40 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
             state.tree_state.select_prev();
         }
         Action::MoveDown => {
-            let visible_count = state.tree.visible_nodes().len();
+            let visible_count = build_rows(state).len();
             state.tree_state.select_next(visible_count);
         }
         Action::Expand => {
-            maybe_pin_selected_non_dir(state);
-            if let Some(node_id) = selected_node_id(state) {
-                let t0 = std::time::Instant::now();
-                let _ = fs::expand_node(
-                    &mut state.tree,
-                    node_id,
-                    &state.walk_config,
-                    state.config.one_file_system,
-                );
-                state.tree.get_mut(node_id).expanded = true;
-                // Invalidate only this dir's cached local_sum — its children
-                // moved from non-tree to tree, changing how bytes are counted.
-                // All other dirs' caches remain valid.
-                let path = state.tree.get(node_id).meta.path.clone();
-                state.dir_local_sums.remove(&path);
-                state.needs_size_recompute = true;
-                tracing::debug!("expand_node: {:.2?} path={}", t0.elapsed(), path.display());
+            // Groups: toggle expand/collapse.
+            if let Some((key, _)) = selected_group_key(state) {
+                toggle_group(state, &key);
+            } else {
+                // Files: toggle pin. Dirs: expand tree node.
+                maybe_pin_selected_non_dir(state);
+                if let Some(node_id) = selected_node_id(state) {
+                    let t0 = std::time::Instant::now();
+                    let _ = fs::expand_node(
+                        &mut state.tree,
+                        node_id,
+                        &state.walk_config,
+                        state.config.one_file_system,
+                    );
+                    state.tree.get_mut(node_id).expanded = true;
+                    let path = state.tree.get(node_id).meta.path.clone();
+                    state.dir_local_sums.remove(&path);
+                    state.needs_size_recompute = true;
+                    tracing::debug!("expand_node: {:.2?} path={}", t0.elapsed(), path.display());
+                }
             }
         }
         Action::Collapse => {
+            // Groups: collapse if expanded, else fall through to normal collapse.
+            if let Some((key, expanded)) = selected_group_key(state) {
+                if expanded {
+                    toggle_group(state, &key);
+                    return;
+                }
+            }
             handle_collapse(state);
         }
         Action::JumpSiblingUp => {
@@ -418,6 +428,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                         toggle_pin_for_node(state, *node_id);
                         state.last_left_click = None;
                     }
+                } else if let Some(TreeRow::Group { group_key, .. }) =
+                    rows.get(clicked_row)
+                {
+                    // Clicking a group row toggles its expand state.
+                    let key = group_key.clone();
+                    toggle_group(state, &key);
+                    state.last_left_click = None;
                 } else {
                     state.last_left_click = None;
                 }
@@ -454,7 +471,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                     (state.inspector_pin_scroll + 1).min(geom.max_scroll);
                 return;
             }
-            let visible_count = state.tree.visible_nodes().len();
+            let visible_count = build_rows(state).len();
             state.tree_state.select_next(visible_count);
         }
         _ => {}
@@ -464,7 +481,9 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
 // ── helpers ─────────────────────────────────────────────────────
 
 fn build_rows(state: &AppState) -> Vec<TreeRow> {
-    TreeWidget::new(&state.tree, &state.grouping_config).build_rows()
+    TreeWidget::new(&state.tree, &state.grouping_config)
+        .expanded_groups(&state.expanded_groups)
+        .build_rows()
 }
 
 fn selected_node_id(state: &AppState) -> Option<NodeId> {
@@ -473,6 +492,28 @@ fn selected_node_id(state: &AppState) -> Option<NodeId> {
         TreeRow::Node { node_id, .. } => Some(*node_id),
         TreeRow::Group { .. } => None,
     })
+}
+
+/// If the selected row is a Group, return its key and expanded state.
+fn selected_group_key(state: &AppState) -> Option<(String, bool)> {
+    let rows = build_rows(state);
+    rows.get(state.tree_state.selected).and_then(|row| match row {
+        TreeRow::Group {
+            group_key,
+            expanded,
+            ..
+        } => Some((group_key.clone(), *expanded)),
+        _ => None,
+    })
+}
+
+/// Toggle expand state of a group by key.
+fn toggle_group(state: &mut AppState, key: &str) {
+    if state.expanded_groups.contains(key) {
+        state.expanded_groups.remove(key);
+    } else {
+        state.expanded_groups.insert(key.to_string());
+    }
 }
 
 /// Selected tree entry path, if the currently selected row is a node.

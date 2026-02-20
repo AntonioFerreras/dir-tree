@@ -30,12 +30,12 @@ use ratatui::{
 use crate::app::{
     event::{spawn_event_reader, AppEvent},
     handler,
-    state::{ActiveView, AppState, PaneFocus},
+    state::{ActiveView, AppState, PaneFocus, RightPaneTab},
 };
 use crate::shell::integration;
 use crate::ui::{
     inspector::InspectorWidget, layout::AppLayout, popup, spinner::ScanIndicator, theme::Theme,
-    tree_widget::TreeWidget,
+    search::SearchWidget, tree_widget::TreeWidget,
 };
 
 // ───────────────────────────────────────── CLI ───────────────
@@ -202,9 +202,13 @@ async fn main() -> Result<()> {
 
             frame.render_stateful_widget(tree_widget, layout.tree_area, &mut state.tree_state);
 
+            let tab_title = match state.right_pane_tab {
+                RightPaneTab::Inspector => "[Inspector] | Search",
+                RightPaneTab::Search => "Inspector | [Search]",
+            };
             let inspector_block = Block::default()
                 .title(format!(
-                    " Inspector{} · Tab: switch pane ",
+                    " Right Pane {tab_title}{} · Tab: switch pane ",
                     if inspector_focused { " [focused]" } else { "" }
                 ))
                 .title_style(if inspector_focused {
@@ -218,25 +222,46 @@ async fn main() -> Result<()> {
                 } else {
                     Theme::border_style()
                 });
-            frame.render_widget(
-                InspectorWidget {
-                    block: inspector_block,
-                    info: state.inspector_info.as_ref(),
-                    pinned: &state.pinned_inspector,
-                    pin_scroll: state.inspector_pin_scroll,
-                    scroll_row_offset: state.pin_scroll_anim.row_offset(),
-                    selected_pin: if state.pane_focus != PaneFocus::Inspector
-                        || state.pinned_inspector.is_empty()
-                    {
-                        None
-                    } else {
-                        Some(state.inspector_selected_pin)
+            if state.right_pane_tab == RightPaneTab::Inspector {
+                frame.render_widget(
+                    InspectorWidget {
+                        block: inspector_block,
+                        info: state.inspector_info.as_ref(),
+                        pinned: &state.pinned_inspector,
+                        pin_scroll: state.inspector_pin_scroll,
+                        scroll_row_offset: state.pin_scroll_anim.row_offset(),
+                        selected_pin: if state.pane_focus != PaneFocus::Inspector
+                            || state.pinned_inspector.is_empty()
+                        {
+                            None
+                        } else {
+                            Some(state.inspector_selected_pin)
+                        },
+                        has_focus: state.pane_focus == PaneFocus::Inspector,
+                        image_cache: &state.image_cache,
                     },
-                    has_focus: state.pane_focus == PaneFocus::Inspector,
-                    image_cache: &state.image_cache,
-                },
-                layout.inspector_area,
-            );
+                    layout.inspector_area,
+                );
+            } else {
+                let pin_hint = state.config.short_binding(crate::config::Action::Expand);
+                frame.render_widget(
+                    SearchWidget {
+                        block: inspector_block,
+                        root: &state.search_root,
+                        query: &state.search_query,
+                        case_sensitive: state.search_case_sensitive,
+                        results: &state.search_results,
+                        selected: if state.search_results.is_empty() {
+                            None
+                        } else {
+                            Some(state.search_selected)
+                        },
+                        has_focus: state.pane_focus == PaneFocus::Inspector,
+                        pin_hint: &pin_hint,
+                    },
+                    layout.inspector_area,
+                );
+            }
 
             // Scanning indicator (top-right of tree area, overlays the border).
             frame.render_widget(

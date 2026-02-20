@@ -12,6 +12,7 @@ use crate::core::{
     fs::WalkConfig,
     grouping::GroupingConfig,
     inspector::InspectorInfo,
+    search::{SearchEntry, SearchResult},
     tree::{DirTree, NodeId},
 };
 use crate::ui::tree_widget::TreeWidgetState;
@@ -34,6 +35,14 @@ pub enum PaneFocus {
     #[default]
     Tree,
     Inspector,
+}
+
+/// Active tab inside the right pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RightPaneTab {
+    #[default]
+    Inspector,
+    Search,
 }
 
 /// Top-level application state.
@@ -93,6 +102,10 @@ pub struct AppState {
     pub inspector_info: Option<InspectorInfo>,
     /// Which pane receives keyboard navigation in main tree view.
     pub pane_focus: PaneFocus,
+    /// Active tab inside the right pane.
+    pub right_pane_tab: RightPaneTab,
+    /// Previous tab used before entering search.
+    pub right_pane_prev_tab: RightPaneTab,
     /// Keys of file-groups that the user has expanded in the tree.
     pub expanded_groups: HashSet<String>,
     /// Pinned inspector cards, created from tree entries.
@@ -114,6 +127,18 @@ pub struct AppState {
     pub lightbox_index: usize,
     /// Hit zones from the last lightbox render (for mouse click dispatch).
     pub lightbox_hit_zones: Option<crate::ui::lightbox::LightboxHitZones>,
+    /// Search root directory.
+    pub search_root: PathBuf,
+    /// Flat search index for `search_root`.
+    pub search_index: Vec<SearchEntry>,
+    /// Current search query.
+    pub search_query: String,
+    /// Search option: case-sensitive matching.
+    pub search_case_sensitive: bool,
+    /// Ranked matches for the current query.
+    pub search_results: Vec<SearchResult>,
+    /// Selected row in `search_results`.
+    pub search_selected: usize,
 }
 
 impl AppState {
@@ -123,7 +148,7 @@ impl AppState {
             tree_state: TreeWidgetState::default(),
             walk_config: WalkConfig::default(),
             grouping_config: GroupingConfig::default(),
-            cwd,
+            cwd: cwd.clone(),
             selected_dir: None,
             should_quit: false,
             status_message: None,
@@ -144,6 +169,8 @@ impl AppState {
             inspector_path: None,
             inspector_info: None,
             pane_focus: PaneFocus::Tree,
+            right_pane_tab: RightPaneTab::Inspector,
+            right_pane_prev_tab: RightPaneTab::Inspector,
             expanded_groups: HashSet::new(),
             pinned_inspector: Vec::new(),
             inspector_selected_pin: 0,
@@ -153,6 +180,12 @@ impl AppState {
             image_decoding: HashSet::new(),
             lightbox_index: 0,
             lightbox_hit_zones: None,
+            search_root: cwd.clone(),
+            search_index: Vec::new(),
+            search_query: String::new(),
+            search_case_sensitive: false,
+            search_results: Vec::new(),
+            search_selected: 0,
         }
     }
 }

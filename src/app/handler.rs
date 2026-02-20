@@ -3,6 +3,7 @@
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::path::Path;
 use std::time::Instant;
 
 use crate::config::{Action, KeyBind};
@@ -12,7 +13,7 @@ use crate::ui::inspector::pinned_cards_geometry;
 use crate::ui::layout::AppLayout;
 
 use super::settings::{SettingsItem, SETTINGS_ITEMS};
-use super::state::{ActiveView, AppState, PaneFocus};
+use super::state::{ActiveView, AppState, PaneFocus, RightPaneTab};
 use crate::ui::tree_widget::{TreeRow, TreeWidget};
 
 /// Total selectable rows in the controls submenu (actions + "Reset").
@@ -45,14 +46,27 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) {
 // ── Tree view (configurable bindings) ───────────────────────────
 
 fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
+    if is_search_shortcut(key) {
+        toggle_search_tab(state);
+        return;
+    }
+
+    if state.right_pane_tab == RightPaneTab::Search {
+        if handle_search_key(state, key) {
+            return;
+        }
+    }
+
     if key.code == KeyCode::Tab {
         state.pane_focus = match state.pane_focus {
             PaneFocus::Tree => PaneFocus::Inspector,
             PaneFocus::Inspector => PaneFocus::Tree,
         };
-        // When tabbing into inspector, reveal the selected pinned file in tree.
-        if state.pane_focus == PaneFocus::Inspector {
+        // When tabbing into inspector, reveal selected item in tree.
+        if state.pane_focus == PaneFocus::Inspector && state.right_pane_tab == RightPaneTab::Inspector {
             reveal_selected_pin_in_tree(state);
+        } else if state.pane_focus == PaneFocus::Inspector && state.right_pane_tab == RightPaneTab::Search {
+            reveal_selected_search_in_tree(state);
         }
         return;
     }
@@ -470,6 +484,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
             if point_in_rect(layout.inspector_area, mouse.column, mouse.row)
                 || state.pane_focus == PaneFocus::Inspector
             {
+                if state.right_pane_tab == RightPaneTab::Search {
+                    if state.search_selected > 0 {
+                        state.search_selected -= 1;
+                        reveal_selected_search_in_tree(state);
+                    }
+                    return;
+                }
                 if state.inspector_pin_scroll > 0 {
                     state.inspector_pin_scroll -= 1;
                 }
@@ -481,6 +502,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
             if point_in_rect(layout.inspector_area, mouse.column, mouse.row)
                 || state.pane_focus == PaneFocus::Inspector
             {
+                if state.right_pane_tab == RightPaneTab::Search {
+                    if state.search_selected + 1 < state.search_results.len() {
+                        state.search_selected += 1;
+                        reveal_selected_search_in_tree(state);
+                    }
+                    return;
+                }
                 let geom = inspector_geom(state);
                 state.inspector_pin_scroll =
                     (state.inspector_pin_scroll + 1).min(geom.max_scroll);
@@ -605,6 +633,8 @@ fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
             state.file_sizes.clear();
             state.dir_local_sums.clear();
             state.needs_size_recompute = true;
+            state.search_root = state.cwd.clone();
+            state.search_index.clear();
         } else {
             return;
         }
@@ -777,6 +807,10 @@ fn toggle_dir_with_click(state: &mut AppState, node_id: NodeId) {
 }
 
 fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
+    if state.right_pane_tab == RightPaneTab::Search {
+        return handle_search_key(state, key);
+    }
+
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             if state.inspector_selected_pin > 0 {
@@ -834,6 +868,11 @@ fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
 }
 
 fn handle_inspector_click(state: &mut AppState, inspector_area: ratatui::layout::Rect, col: u16, row: u16) {
+    if state.right_pane_tab == RightPaneTab::Search {
+        handle_search_click(state, inspector_area, row);
+        return;
+    }
+
     let inner = ratatui::widgets::Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .inner(inspector_area);
@@ -874,29 +913,7 @@ fn toggle_pin_for_node(state: &mut AppState, node_id: NodeId) {
         return;
     }
     let path = state.tree.get(node_id).meta.path.clone();
-
-    // Already pinned → unpin it.
-    if let Some((idx, _)) = state
-        .pinned_inspector
-        .iter()
-        .enumerate()
-        .find(|(_, info)| info.path == path)
-    {
-        remove_pin_at(state, idx);
-        return;
-    }
-
-    // Not pinned → pin it.
-    let mut info = crate::core::inspector::inspect_path(&path);
-    if let Some(sz) = state.dir_sizes.get(&path).copied() {
-        info.size_bytes = Some(sz);
-    } else if let Some(sz) = state.file_sizes.get(&path).copied() {
-        info.size_bytes = Some(sz);
-    }
-    state.pinned_inspector.push(info);
-    state.inspector_selected_pin = state.pinned_inspector.len().saturating_sub(1);
-    clamp_inspector_selection_and_scroll(state);
-    persist_pins(state);
+    toggle_pin_for_path(state, &path);
 }
 
 fn maybe_pin_selected_non_dir(state: &mut AppState) {
@@ -988,6 +1005,9 @@ fn rebuild_tree(state: &mut AppState) {
         state.file_sizes.clear();
         state.dir_local_sums.clear();
         state.needs_size_recompute = true;
+        state.search_root = state.cwd.clone();
+        state.search_index.clear();
+        refresh_search_results(state);
     }
 }
 
@@ -1008,6 +1028,9 @@ fn move_root_to_parent(state: &mut AppState) {
             state.dir_local_sums.clear();
             state.needs_size_recompute = true;
             state.status_message = Some(format!("Moved to parent: {}", state.cwd.display()));
+            state.search_root = state.cwd.clone();
+            state.search_index.clear();
+            refresh_search_results(state);
         }
         Err(_) => {
             state.status_message = Some("Cannot open parent directory".to_string());
@@ -1020,4 +1043,174 @@ fn point_in_rect(area: ratatui::layout::Rect, col: u16, row: u16) -> bool {
         && col < area.x.saturating_add(area.width)
         && row >= area.y
         && row < area.y.saturating_add(area.height)
+}
+
+fn is_search_shortcut(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Char('/') && key.modifiers.is_empty())
+        || (key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn toggle_search_tab(state: &mut AppState) {
+    if state.right_pane_tab == RightPaneTab::Search {
+        state.right_pane_tab = state.right_pane_prev_tab;
+        return;
+    }
+
+    state.right_pane_prev_tab = state.right_pane_tab;
+    state.right_pane_tab = RightPaneTab::Search;
+    state.pane_focus = PaneFocus::Inspector;
+    ensure_search_index(state);
+    refresh_search_results(state);
+    reveal_selected_search_in_tree(state);
+}
+
+fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
+    if state.right_pane_tab != RightPaneTab::Search {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.right_pane_tab = state.right_pane_prev_tab;
+            true
+        }
+        KeyCode::Up => {
+            if state.search_selected > 0 {
+                state.search_selected -= 1;
+                reveal_selected_search_in_tree(state);
+            }
+            true
+        }
+        KeyCode::Down => {
+            if state.search_selected + 1 < state.search_results.len() {
+                state.search_selected += 1;
+                reveal_selected_search_in_tree(state);
+            }
+            true
+        }
+        KeyCode::Home => {
+            if !state.search_results.is_empty() {
+                state.search_selected = 0;
+                reveal_selected_search_in_tree(state);
+            }
+            true
+        }
+        KeyCode::End => {
+            if !state.search_results.is_empty() {
+                state.search_selected = state.search_results.len() - 1;
+                reveal_selected_search_in_tree(state);
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            state.search_query.pop();
+            refresh_search_results(state);
+            true
+        }
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::ALT => {
+            state.search_case_sensitive = !state.search_case_sensitive;
+            refresh_search_results(state);
+            true
+        }
+        KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            state.search_query.push(ch);
+            refresh_search_results(state);
+            true
+        }
+        _ => {
+            if let Some(action) = state.config.match_key(key) {
+                if action == Action::Expand {
+                    let selected_path = state
+                        .search_results
+                        .get(state.search_selected)
+                        .map(|r| r.path.clone());
+                    if let Some(path) = selected_path {
+                        toggle_pin_for_path(state, &path);
+                    }
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn ensure_search_index(state: &mut AppState) {
+    if state.search_root != state.cwd || state.search_index.is_empty() {
+        state.search_root = state.cwd.clone();
+        state.search_index = crate::core::search::build_index(
+            &state.search_root,
+            state.walk_config.show_hidden,
+            state.walk_config.respect_gitignore,
+            state.config.one_file_system,
+        );
+    }
+}
+
+fn refresh_search_results(state: &mut AppState) {
+    ensure_search_index(state);
+    state.search_results = crate::core::search::search_entries(
+        &state.search_index,
+        &state.search_query,
+        state.search_case_sensitive,
+        300,
+    );
+    if state.search_results.is_empty() {
+        state.search_selected = 0;
+    } else {
+        state.search_selected = state.search_selected.min(state.search_results.len() - 1);
+    }
+}
+
+fn reveal_selected_search_in_tree(state: &mut AppState) {
+    if state.search_results.is_empty() {
+        return;
+    }
+    if let Some(path) = state.search_results.get(state.search_selected).map(|r| r.path.clone()) {
+        reveal_path_in_tree(state, &path);
+    }
+}
+
+fn toggle_pin_for_path(state: &mut AppState, path: &Path) {
+    // Already pinned -> unpin.
+    if let Some((idx, _)) = state
+        .pinned_inspector
+        .iter()
+        .enumerate()
+        .find(|(_, info)| info.path == path)
+    {
+        remove_pin_at(state, idx);
+        return;
+    }
+
+    // Only files are pinnable.
+    if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(true) {
+        return;
+    }
+
+    let mut info = crate::core::inspector::inspect_path(path);
+    if let Some(sz) = state.dir_sizes.get(path).copied() {
+        info.size_bytes = Some(sz);
+    } else if let Some(sz) = state.file_sizes.get(path).copied() {
+        info.size_bytes = Some(sz);
+    }
+    state.pinned_inspector.push(info);
+    state.inspector_selected_pin = state.pinned_inspector.len().saturating_sub(1);
+    clamp_inspector_selection_and_scroll(state);
+    persist_pins(state);
+}
+
+fn handle_search_click(state: &mut AppState, inspector_area: ratatui::layout::Rect, row: u16) {
+    let inner = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(inspector_area);
+    let results_start = inner.y.saturating_add(4);
+    if row < results_start {
+        return;
+    }
+    let idx = row.saturating_sub(results_start) as usize;
+    if idx < state.search_results.len() {
+        state.search_selected = idx;
+        reveal_selected_search_in_tree(state);
+    }
 }

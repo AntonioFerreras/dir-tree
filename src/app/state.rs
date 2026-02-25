@@ -3,7 +3,7 @@
 //! All mutable state lives here so that the rest of the app can be pure
 //! functions over `&AppState` (rendering) or `&mut AppState` (event handling).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -139,6 +139,30 @@ pub struct AppState {
     pub search_results: Vec<SearchResult>,
     /// Selected row in `search_results`.
     pub search_selected: usize,
+    /// Scroll offset for search results.
+    pub search_scroll: usize,
+    /// Path copied to clipboard before exit (if any).
+    pub copied_path: Option<PathBuf>,
+    /// Root-change request processed by the background fs runtime.
+    pub pending_tree_rebuild: Option<PathBuf>,
+    /// Current tree rebuild generation in flight.
+    pub tree_rebuild_in_flight: Option<u64>,
+    /// Monotonic generation id for tree rebuild requests.
+    pub tree_rebuild_generation: u64,
+    /// Queue of directory paths to lazily expand in background.
+    pub pending_expand_paths: VecDeque<PathBuf>,
+    /// Paths currently expanding in background.
+    pub expand_in_flight: HashSet<PathBuf>,
+    /// Pending reveal target path that should be retried after async scans.
+    pub pending_reveal_path: Option<PathBuf>,
+    /// Whether search index should be rebuilt for the current root.
+    pub search_reindex_requested: bool,
+    /// Search index generation currently in flight.
+    pub search_reindex_in_flight: Option<u64>,
+    /// Monotonic generation id for search reindex requests.
+    pub search_reindex_generation: u64,
+    /// Non-size background scanning in progress (tree/search/expand jobs).
+    pub fs_scanning: bool,
 }
 
 impl AppState {
@@ -186,6 +210,18 @@ impl AppState {
             search_case_sensitive: false,
             search_results: Vec::new(),
             search_selected: 0,
+            search_scroll: 0,
+            copied_path: None,
+            pending_tree_rebuild: None,
+            tree_rebuild_in_flight: None,
+            tree_rebuild_generation: 0,
+            pending_expand_paths: VecDeque::new(),
+            expand_in_flight: HashSet::new(),
+            pending_reveal_path: None,
+            search_reindex_requested: true,
+            search_reindex_in_flight: None,
+            search_reindex_generation: 0,
+            fs_scanning: false,
         }
     }
 }

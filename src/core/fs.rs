@@ -142,21 +142,12 @@ pub fn build_tree(root: &Path, config: &WalkConfig, one_file_system: bool) -> an
 /// Lazily expand a single directory that hasn't been populated yet.
 /// Useful when the user expands a previously-collapsed node beyond the
 /// initial `max_depth`.
-pub fn expand_node(
-    tree: &mut DirTree,
-    node_id: NodeId,
+pub fn scan_immediate_children(
+    dir: &Path,
     config: &WalkConfig,
     one_file_system: bool,
-) -> anyhow::Result<()> {
-    let node = tree.get(node_id);
-    if !node.meta.is_dir || !node.children.is_empty() {
-        return Ok(());
-    }
-    let dir = node.meta.path.clone();
-
-    // Walk immediate children only (single level); deeper expansion
-    // happens lazily when the user expands those children.
-    let walker = WalkBuilder::new(&dir)
+) -> Vec<EntryMeta> {
+    let walker = WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(!config.show_hidden)
         .git_ignore(config.respect_gitignore)
@@ -168,7 +159,7 @@ pub fn expand_node(
     let mut files = Vec::new();
 
     for entry in walker.flatten() {
-        if entry.path() == dir.as_path() {
+        if entry.path() == dir {
             continue;
         }
         let meta = meta_from_dir_entry(&entry);
@@ -182,10 +173,26 @@ pub fn expand_node(
     sort_by_name(&mut dirs);
     sort_by_name(&mut files);
 
-    for meta in dirs {
-        tree.add_child(node_id, meta);
+    dirs.extend(files);
+    dirs
+}
+
+/// Lazily expand a single directory that hasn't been populated yet.
+/// Useful when the user expands a previously-collapsed node beyond the
+/// initial `max_depth`.
+pub fn expand_node(
+    tree: &mut DirTree,
+    node_id: NodeId,
+    config: &WalkConfig,
+    one_file_system: bool,
+) -> anyhow::Result<()> {
+    let node = tree.get(node_id);
+    if !node.meta.is_dir || !node.children.is_empty() {
+        return Ok(());
     }
-    for meta in files {
+    let dir = node.meta.path.clone();
+
+    for meta in scan_immediate_children(&dir, config, one_file_system) {
         tree.add_child(node_id, meta);
     }
 

@@ -16,7 +16,10 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -29,6 +32,7 @@ use ratatui::{
 
 use crate::app::{
     event::{spawn_event_reader, AppEvent},
+    fs_runtime::{self, FsUpdate},
     handler,
     state::{ActiveView, AppState, PaneFocus, RightPaneTab},
 };
@@ -132,7 +136,13 @@ async fn main() -> Result<()> {
     execute!(
         stderr_handle,
         EnterAlternateScreen,
-        EnableMouseCapture
+        EnableMouseCapture,
+        // Best effort: ask terminals that support enhanced keyboard protocol
+        // to preserve modifier info for keys like Shift+Enter.
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
     )?;
     let backend = CrosstermBackend::new(stderr());
     let mut terminal = Terminal::new(backend)?;
@@ -140,6 +150,7 @@ async fn main() -> Result<()> {
     // ── async channels ────────────────────────────────────────
     let mut events = spawn_event_reader(Duration::from_millis(50));
     let (size_tx, mut size_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, SizeUpdate)>();
+    let (fs_tx, mut fs_rx) = tokio::sync::mpsc::unbounded_channel::<FsUpdate>();
     let mut size_compute: Option<SizeComputeState> = None;
     let mut tick_count: u64 = 0;
 
@@ -256,6 +267,7 @@ async fn main() -> Result<()> {
                         } else {
                             Some(state.search_selected)
                         },
+                        scroll: state.search_scroll,
                         has_focus: state.pane_focus == PaneFocus::Inspector,
                         pin_hint: &pin_hint,
                     },
@@ -266,15 +278,26 @@ async fn main() -> Result<()> {
             // Scanning indicator (top-right of tree area, overlays the border).
             frame.render_widget(
                 ScanIndicator {
-                    visible: state.scanning,
+                    visible: state.scanning || state.fs_scanning,
                     tick: tick_count,
                 },
                 layout.tree_area,
             );
 
-            let hint = state.config.status_bar_hint();
+            let nav_hint = format!(
+                "{}: navigate | {}: expand/collapse | {}: settings",
+                state.config.short_binding(crate::config::Action::MoveUp),
+                state.config.short_binding(crate::config::Action::Expand),
+                state.config.short_binding(crate::config::Action::OpenSettings),
+            );
+            let selection_hint =
+                "Enter: open dir / copy file path | Shift+Enter: copy selected path";
+            let default_hint = format!("{nav_hint} | {selection_hint}");
             let status_text = match state.active_view {
-                ActiveView::Tree => state.status_message.as_deref().unwrap_or(&hint),
+                ActiveView::Tree => state
+                    .status_message
+                    .as_deref()
+                    .unwrap_or(&default_hint),
                 ActiveView::SettingsMenu | ActiveView::ControlsSubmenu | ActiveView::Lightbox => "",
             };
             let status = Paragraph::new(status_text).style(Theme::status_bar_style());
@@ -330,6 +353,50 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Kick off queued background filesystem/search jobs.
+        if state.tree_rebuild_in_flight.is_none() {
+            if let Some(root) = state.pending_tree_rebuild.take() {
+                state.tree_rebuild_generation = state.tree_rebuild_generation.wrapping_add(1);
+                let generation = state.tree_rebuild_generation;
+                state.tree_rebuild_in_flight = Some(generation);
+                fs_runtime::spawn_tree_rebuild(
+                    fs_tx.clone(),
+                    generation,
+                    root,
+                    state.walk_config.clone(),
+                    state.config.one_file_system,
+                );
+            }
+        }
+
+        // Expand queued directories in background.
+        while let Some(path) = state.pending_expand_paths.pop_front() {
+            fs_runtime::spawn_dir_expand(
+                fs_tx.clone(),
+                path,
+                state.walk_config.clone(),
+                state.config.one_file_system,
+            );
+        }
+
+        if state.search_reindex_requested && state.search_reindex_in_flight.is_none() {
+            state.search_reindex_requested = false;
+            state.search_reindex_generation = state.search_reindex_generation.wrapping_add(1);
+            let generation = state.search_reindex_generation;
+            state.search_reindex_in_flight = Some(generation);
+            fs_runtime::spawn_search_index(
+                fs_tx.clone(),
+                generation,
+                state.search_root.clone(),
+                state.walk_config.clone(),
+                state.config.one_file_system,
+            );
+        }
+
+        state.fs_scanning = state.tree_rebuild_in_flight.is_some()
+            || !state.expand_in_flight.is_empty()
+            || state.search_reindex_in_flight.is_some();
+
         tokio::select! {
             biased;
 
@@ -377,6 +444,70 @@ async fn main() -> Result<()> {
                     state.scanning = compute.is_scanning();
                 }
             }
+
+            Some(update) = fs_rx.recv() => {
+                match update {
+                    FsUpdate::TreeRebuilt { generation, root, result } => {
+                        if state.tree_rebuild_in_flight == Some(generation) {
+                            state.tree_rebuild_in_flight = None;
+                            match result {
+                                Ok(tree) => {
+                                    state.cwd = root;
+                                    state.tree = tree;
+                                    state.tree_state.selected = 0;
+                                    state.tree_state.offset = 0;
+                                    state.dir_sizes.clear();
+                                    state.file_sizes.clear();
+                                    state.dir_local_sums.clear();
+                                    state.needs_size_recompute = true;
+
+                                    state.search_root = state.cwd.clone();
+                                    state.search_index.clear();
+                                    state.search_reindex_requested = true;
+                                    handler::refresh_search(&mut state);
+                                }
+                                Err(_) => {
+                                    state.status_message = Some("Cannot open directory".to_string());
+                                }
+                            }
+                        }
+                    }
+                    FsUpdate::DirExpanded { path, result } => {
+                        state.expand_in_flight.remove(&path);
+                        if let Ok(children) = result {
+                            if let Some((parent_id, _)) = state
+                                .tree
+                                .nodes
+                                .iter()
+                                .enumerate()
+                                .find(|(_, n)| n.meta.path == path)
+                            {
+                                if state.tree.get(parent_id).children.is_empty() {
+                                    for meta in children {
+                                        state.tree.add_child(parent_id, meta);
+                                    }
+                                    state.dir_local_sums.remove(&path);
+                                    state.needs_size_recompute = true;
+                                }
+                            }
+                        }
+                    }
+                    FsUpdate::SearchIndexed { generation, root, entries } => {
+                        if state.search_reindex_in_flight == Some(generation)
+                            && root == state.search_root
+                        {
+                            state.search_reindex_in_flight = None;
+                            state.search_index = entries;
+                            handler::refresh_search(&mut state);
+                        }
+                    }
+                }
+
+                handler::retry_pending_reveal(&mut state);
+                state.fs_scanning = state.tree_rebuild_in_flight.is_some()
+                    || !state.expand_in_flight.is_empty()
+                    || state.search_reindex_in_flight.is_some();
+            }
         }
 
         if state.should_quit {
@@ -389,13 +520,12 @@ async fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        PopKeyboardEnhancementFlags
     )?;
     terminal.show_cursor()?;
 
-    if let Some(ref dir) = state.selected_dir {
-        integration::print_selected_dir(dir);
-    }
+    integration::print_exit_payload(state.selected_dir.as_deref(), state.copied_path.as_deref());
 
     Ok(())
 }

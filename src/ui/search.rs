@@ -20,6 +20,7 @@ pub struct SearchWidget<'a> {
     pub case_sensitive: bool,
     pub results: &'a [SearchResult],
     pub selected: Option<usize>,
+    pub scroll: usize,
     pub has_focus: bool,
     pub pin_hint: &'a str,
 }
@@ -57,11 +58,7 @@ impl<'a> Widget for SearchWidget<'a> {
         } else {
             "[ ] case-sensitive (Alt+c)"
         };
-        Paragraph::new(Line::from(vec![
-            Span::styled(case_text, Theme::size_style()),
-            Span::raw("  "),
-            Span::styled(format!("Pin: {}", self.pin_hint), Theme::size_style()),
-        ]))
+        Paragraph::new(Line::from(vec![Span::styled(case_text, Theme::size_style())]))
         .render(Rect::new(inner.x, y, inner.width, 1), buf);
         y = y.saturating_add(1);
         if y >= bottom {
@@ -86,7 +83,7 @@ impl<'a> Widget for SearchWidget<'a> {
             return;
         }
 
-        let max_rows = bottom.saturating_sub(y) as usize;
+        let max_rows = search_results_capacity(inner);
         if self.results.is_empty() {
             let empty = if self.query.trim().is_empty() {
                 "Type to search."
@@ -98,8 +95,17 @@ impl<'a> Widget for SearchWidget<'a> {
             return;
         }
 
-        for (row_idx, result) in self.results.iter().take(max_rows).enumerate() {
-            let selected = self.selected == Some(row_idx);
+        let scroll = self.scroll.min(self.results.len().saturating_sub(1));
+        for (row_idx, result) in self
+            .results
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(max_rows)
+            .map(|(idx, r)| (idx - scroll, r))
+        {
+            let absolute_idx = scroll + row_idx;
+            let selected = self.selected == Some(absolute_idx);
             let style = if selected {
                 Theme::selected_style()
             } else if result.is_dir {
@@ -111,11 +117,33 @@ impl<'a> Widget for SearchWidget<'a> {
             let parent = result.path.parent().unwrap_or(self.root);
             let avail_for_parent = inner.width.saturating_sub(20) as usize;
             let compact_parent = truncate_parent_path(parent, avail_for_parent.max(8));
-            let text = format!("{marker}{}  {}", result.name, compact_parent);
-            Paragraph::new(Line::from(Span::styled(text, style)))
+            let mut spans = vec![Span::styled(
+                format!("{marker}{}  {}", result.name, compact_parent),
+                style,
+            )];
+            if selected && !result.is_dir {
+                spans.push(Span::styled(
+                    format!("  {} to pin file on inspector", self.pin_hint),
+                    Theme::root_hint_style(),
+                ));
+            }
+            Paragraph::new(Line::from(spans))
                 .render(Rect::new(inner.x, y + row_idx as u16, inner.width, 1), buf);
         }
+
+        render_scrollbar(
+            Rect::new(inner.x, y, inner.width, max_rows as u16),
+            self.results.len(),
+            scroll,
+            max_rows,
+            buf,
+        );
     }
+}
+
+/// Number of rows available for search results (below the header fields).
+pub fn search_results_capacity(inner: Rect) -> usize {
+    inner.height.saturating_sub(4) as usize
 }
 
 fn truncate_parent_path(path: &Path, max_chars: usize) -> String {
@@ -175,6 +203,43 @@ fn middle_ellipsis(s: &str, max_chars: usize) -> String {
         }
     }
     format!("{left_part}...{right_part}")
+}
+
+fn render_scrollbar(
+    area: Rect,
+    total: usize,
+    offset: usize,
+    visible: usize,
+    buf: &mut Buffer,
+) {
+    use ratatui::layout::Position;
+
+    if total <= visible || area.height < 2 || area.width == 0 {
+        return;
+    }
+
+    let x = area.x + area.width.saturating_sub(1);
+    let h = area.height as f64;
+    let thumb_sz = ((visible as f64 / total as f64) * h).ceil().max(1.0) as u16;
+    let max_off = total.saturating_sub(visible) as f64;
+    let thumb_pos = if max_off > 0.0 {
+        ((offset as f64 / max_off) * (h - thumb_sz as f64)).round() as u16
+    } else {
+        0
+    };
+
+    for row in 0..area.height {
+        let y = area.y + row;
+        let is_thumb = row >= thumb_pos && row < thumb_pos + thumb_sz;
+        let (ch, fg) = if is_thumb {
+            ('█', ratatui::style::Color::LightBlue)
+        } else {
+            ('│', ratatui::style::Color::DarkGray)
+        };
+        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+            cell.set_char(ch).set_fg(fg);
+        }
+    }
 }
 
 

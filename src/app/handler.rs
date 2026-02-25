@@ -7,10 +7,11 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::config::{Action, KeyBind};
-use crate::core::fs;
+use crate::shell::integration;
 use crate::core::tree::NodeId;
 use crate::ui::inspector::pinned_cards_geometry;
 use crate::ui::layout::AppLayout;
+use crate::ui::search::search_results_capacity;
 
 use super::settings::{SettingsItem, SETTINGS_ITEMS};
 use super::state::{ActiveView, AppState, PaneFocus, RightPaneTab};
@@ -51,7 +52,7 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
         return;
     }
 
-    if state.right_pane_tab == RightPaneTab::Search {
+    if state.right_pane_tab == RightPaneTab::Search && state.pane_focus == PaneFocus::Inspector {
         if handle_search_key(state, key) {
             return;
         }
@@ -86,6 +87,22 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
                 }
                 _ => {}
             }
+        }
+        return;
+    }
+
+    // Direct Enter/Shift+Enter actions for the selected tree row.
+    if key.code == KeyCode::Enter && is_simple_enter_combo(key.modifiers) {
+        if let Some(node_id) = selected_node_id(state) {
+            let node = state.tree.get(node_id);
+            let path = node.meta.path.clone();
+            let is_dir = node.meta.is_dir;
+            activate_selected_path(
+                state,
+                &path,
+                is_dir,
+                key.modifiers.contains(KeyModifiers::SHIFT),
+            );
         }
         return;
     }
@@ -135,18 +152,9 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
                 // Files: toggle pin. Dirs: expand tree node.
                 maybe_pin_selected_non_dir(state);
                 if let Some(node_id) = selected_node_id(state) {
-                    let t0 = std::time::Instant::now();
-                    let _ = fs::expand_node(
-                        &mut state.tree,
-                        node_id,
-                        &state.walk_config,
-                        state.config.one_file_system,
-                    );
                     state.tree.get_mut(node_id).expanded = true;
                     let path = state.tree.get(node_id).meta.path.clone();
-                    state.dir_local_sums.remove(&path);
-                    state.needs_size_recompute = true;
-                    tracing::debug!("expand_node: {:.2?} path={}", t0.elapsed(), path.display());
+                    request_expand_path(state, path);
                 }
             }
         }
@@ -169,10 +177,9 @@ fn handle_tree_key(state: &mut AppState, key: KeyEvent) {
         Action::CdIntoDir => {
             if let Some(node_id) = selected_node_id(state) {
                 let node = state.tree.get(node_id);
-                if node.meta.is_dir {
-                    state.selected_dir = Some(node.meta.path.clone());
-                    state.should_quit = true;
-                }
+                let path = node.meta.path.clone();
+                let is_dir = node.meta.is_dir;
+                activate_selected_path(state, &path, is_dir, false);
             }
         }
         Action::ToggleHidden => {
@@ -487,6 +494,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                 if state.right_pane_tab == RightPaneTab::Search {
                     if state.search_selected > 0 {
                         state.search_selected -= 1;
+                        clamp_search_selection_and_scroll(state);
                         reveal_selected_search_in_tree(state);
                     }
                     return;
@@ -505,6 +513,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
                 if state.right_pane_tab == RightPaneTab::Search {
                     if state.search_selected + 1 < state.search_results.len() {
                         state.search_selected += 1;
+                        clamp_search_selection_and_scroll(state);
                         reveal_selected_search_in_tree(state);
                     }
                     return;
@@ -609,6 +618,8 @@ fn reveal_selected_pin_in_tree(state: &mut AppState) {
 /// 2. Expanding each ancestor directory along the path.
 /// 3. Selecting the target's row in the tree widget.
 fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
+    state.pending_reveal_path = Some(target.to_path_buf());
+
     // Step 1: If the file is not under the current cwd, move root up.
     if !target.starts_with(&state.cwd) {
         // Find the deepest common ancestor.
@@ -623,21 +634,8 @@ fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
                 break;
             }
         }
-        // Rebuild tree from the common ancestor.
-        if let Ok(tree) = fs::build_tree(&ancestor, &state.walk_config, state.config.one_file_system) {
-            state.cwd = ancestor;
-            state.tree = tree;
-            state.tree_state.selected = 0;
-            state.tree_state.offset = 0;
-            state.dir_sizes.clear();
-            state.file_sizes.clear();
-            state.dir_local_sums.clear();
-            state.needs_size_recompute = true;
-            state.search_root = state.cwd.clone();
-            state.search_index.clear();
-        } else {
-            return;
-        }
+        queue_tree_rebuild(state, ancestor);
+        return;
     }
 
     // Step 2: Walk from cwd to the target, expanding each directory.
@@ -666,19 +664,11 @@ fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
             .map(|(i, _)| i);
 
         if let Some(nid) = node_id {
-            // Expand it (lazy-load children if needed).
-            let _ = fs::expand_node(
-                &mut state.tree,
-                nid,
-                &state.walk_config,
-                state.config.one_file_system,
-            );
             state.tree.get_mut(nid).expanded = true;
             let path = state.tree.get(nid).meta.path.clone();
-            state.dir_local_sums.remove(&path);
+            request_expand_path(state, path);
         }
     }
-    state.needs_size_recompute = true;
 
     // Step 3: If the file is inside a collapsed group, expand that group.
     // Build rows and check: if the target isn't found as a Node row, look
@@ -695,6 +685,7 @@ fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
         });
         if let Some((i, _)) = found {
             state.tree_state.selected = i;
+            state.pending_reveal_path = None;
             break;
         }
 
@@ -726,6 +717,7 @@ fn reveal_path_in_tree(state: &mut AppState, target: &std::path::Path) {
             // Loop again — now the group is expanded and the file should be visible.
         } else {
             // Neither a visible node nor inside any group — give up.
+            state.pending_reveal_path = Some(target.to_path_buf());
             break;
         }
     }
@@ -789,21 +781,10 @@ fn toggle_dir_with_click(state: &mut AppState, node_id: NodeId) {
         return;
     }
 
-    let t0 = std::time::Instant::now();
-    let _ = fs::expand_node(
-        &mut state.tree,
-        node_id,
-        &state.walk_config,
-        state.config.one_file_system,
-    );
     state.tree.get_mut(node_id).expanded = true;
 
-    // Invalidate only this dir's cached local_sum — its children moved
-    // from non-tree to tree, changing how bytes are counted.
     let path = state.tree.get(node_id).meta.path.clone();
-    state.dir_local_sums.remove(&path);
-    state.needs_size_recompute = true;
-    tracing::debug!("expand_node(click): {:.2?} path={}", t0.elapsed(), path.display());
+    request_expand_path(state, path);
 }
 
 fn handle_inspector_focus_key(state: &mut AppState, key: KeyEvent) -> bool {
@@ -997,18 +978,7 @@ fn clamp_inspector_selection_and_scroll(state: &mut AppState) {
 }
 
 fn rebuild_tree(state: &mut AppState) {
-    if let Ok(tree) = fs::build_tree(&state.cwd, &state.walk_config, state.config.one_file_system) {
-        state.tree = tree;
-        state.tree_state.selected = 0;
-        state.tree_state.offset = 0;
-        state.dir_sizes.clear();
-        state.file_sizes.clear();
-        state.dir_local_sums.clear();
-        state.needs_size_recompute = true;
-        state.search_root = state.cwd.clone();
-        state.search_index.clear();
-        refresh_search_results(state);
-    }
+    queue_tree_rebuild(state, state.cwd.clone());
 }
 
 fn move_root_to_parent(state: &mut AppState) {
@@ -1017,25 +987,8 @@ fn move_root_to_parent(state: &mut AppState) {
         return;
     };
 
-    match fs::build_tree(&parent, &state.walk_config, state.config.one_file_system) {
-        Ok(tree) => {
-            state.cwd = parent;
-            state.tree = tree;
-            state.tree_state.selected = 0;
-            state.tree_state.offset = 0;
-            state.dir_sizes.clear();
-            state.file_sizes.clear();
-            state.dir_local_sums.clear();
-            state.needs_size_recompute = true;
-            state.status_message = Some(format!("Moved to parent: {}", state.cwd.display()));
-            state.search_root = state.cwd.clone();
-            state.search_index.clear();
-            refresh_search_results(state);
-        }
-        Err(_) => {
-            state.status_message = Some("Cannot open parent directory".to_string());
-        }
-    }
+    queue_tree_rebuild(state, parent);
+    state.status_message = None;
 }
 
 fn point_in_rect(area: ratatui::layout::Rect, col: u16, row: u16) -> bool {
@@ -1048,6 +1001,10 @@ fn point_in_rect(area: ratatui::layout::Rect, col: u16, row: u16) -> bool {
 fn is_search_shortcut(key: KeyEvent) -> bool {
     (key.code == KeyCode::Char('/') && key.modifiers.is_empty())
         || (key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_simple_enter_combo(modifiers: KeyModifiers) -> bool {
+    modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
 }
 
 fn toggle_search_tab(state: &mut AppState) {
@@ -1070,6 +1027,17 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
     }
 
     match key.code {
+        KeyCode::Enter if is_simple_enter_combo(key.modifiers) => {
+            if let Some(result) = state.search_results.get(state.search_selected).cloned() {
+                activate_selected_path(
+                    state,
+                    &result.path,
+                    result.is_dir,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+            }
+            true
+        }
         KeyCode::Esc => {
             state.right_pane_tab = state.right_pane_prev_tab;
             true
@@ -1077,6 +1045,7 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::Up => {
             if state.search_selected > 0 {
                 state.search_selected -= 1;
+                clamp_search_selection_and_scroll(state);
                 reveal_selected_search_in_tree(state);
             }
             true
@@ -1084,6 +1053,7 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::Down => {
             if state.search_selected + 1 < state.search_results.len() {
                 state.search_selected += 1;
+                clamp_search_selection_and_scroll(state);
                 reveal_selected_search_in_tree(state);
             }
             true
@@ -1091,6 +1061,7 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::Home => {
             if !state.search_results.is_empty() {
                 state.search_selected = 0;
+                clamp_search_selection_and_scroll(state);
                 reveal_selected_search_in_tree(state);
             }
             true
@@ -1098,6 +1069,7 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::End => {
             if !state.search_results.is_empty() {
                 state.search_selected = state.search_results.len() - 1;
+                clamp_search_selection_and_scroll(state);
                 reveal_selected_search_in_tree(state);
             }
             true
@@ -1105,16 +1077,19 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::Backspace => {
             state.search_query.pop();
             refresh_search_results(state);
+            reveal_selected_search_in_tree(state);
             true
         }
         KeyCode::Char('c') if key.modifiers == KeyModifiers::ALT => {
             state.search_case_sensitive = !state.search_case_sensitive;
             refresh_search_results(state);
+            reveal_selected_search_in_tree(state);
             true
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             state.search_query.push(ch);
             refresh_search_results(state);
+            reveal_selected_search_in_tree(state);
             true
         }
         _ => {
@@ -1136,14 +1111,12 @@ fn handle_search_key(state: &mut AppState, key: KeyEvent) -> bool {
 }
 
 fn ensure_search_index(state: &mut AppState) {
-    if state.search_root != state.cwd || state.search_index.is_empty() {
+    if state.search_root != state.cwd {
         state.search_root = state.cwd.clone();
-        state.search_index = crate::core::search::build_index(
-            &state.search_root,
-            state.walk_config.show_hidden,
-            state.walk_config.respect_gitignore,
-            state.config.one_file_system,
-        );
+        state.search_index.clear();
+        state.search_reindex_requested = true;
+    } else if state.search_index.is_empty() {
+        state.search_reindex_requested = true;
     }
 }
 
@@ -1160,6 +1133,12 @@ fn refresh_search_results(state: &mut AppState) {
     } else {
         state.search_selected = state.search_selected.min(state.search_results.len() - 1);
     }
+    clamp_search_selection_and_scroll(state);
+}
+
+/// Recompute ranked search results using the current in-memory search index.
+pub fn refresh_search(state: &mut AppState) {
+    refresh_search_results(state);
 }
 
 fn reveal_selected_search_in_tree(state: &mut AppState) {
@@ -1208,9 +1187,110 @@ fn handle_search_click(state: &mut AppState, inspector_area: ratatui::layout::Re
     if row < results_start {
         return;
     }
-    let idx = row.saturating_sub(results_start) as usize;
+    let idx = state.search_scroll + row.saturating_sub(results_start) as usize;
     if idx < state.search_results.len() {
         state.search_selected = idx;
+        clamp_search_selection_and_scroll(state);
         reveal_selected_search_in_tree(state);
     }
+}
+
+fn activate_selected_path(state: &mut AppState, path: &Path, is_dir: bool, force_copy: bool) {
+    if is_dir {
+        if force_copy {
+            if integration::copy_path_to_clipboard(path) {
+                state.copied_path = Some(path.to_path_buf());
+                state.selected_dir = None;
+                state.should_quit = true;
+            } else {
+                state.status_message = Some("Failed to copy path to clipboard".to_string());
+            }
+            return;
+        }
+
+        state.selected_dir = Some(path.to_path_buf());
+        state.copied_path = None;
+        state.should_quit = true;
+        return;
+    }
+
+    // Files always copy their own path. Plain Enter also cds to the parent dir.
+    if integration::copy_path_to_clipboard(path) {
+        state.copied_path = Some(path.to_path_buf());
+        if force_copy {
+            state.selected_dir = None;
+        } else {
+            state.selected_dir = path.parent().map(|p| p.to_path_buf());
+        }
+        state.should_quit = true;
+    } else {
+        state.status_message = Some("Failed to copy path to clipboard".to_string());
+    }
+}
+
+fn clamp_search_selection_and_scroll(state: &mut AppState) {
+    if state.search_results.is_empty() {
+        state.search_selected = 0;
+        state.search_scroll = 0;
+        return;
+    }
+
+    state.search_selected = state.search_selected.min(state.search_results.len() - 1);
+
+    let layout = AppLayout::from_area(
+        state.terminal_area,
+        state.config.panel_layout,
+        state.config.panel_split_pct,
+    );
+    let inner = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(layout.inspector_area);
+    let visible = search_results_capacity(inner);
+    if visible == 0 {
+        state.search_scroll = 0;
+        return;
+    }
+
+    let max_scroll = state.search_results.len().saturating_sub(visible);
+    state.search_scroll = state.search_scroll.min(max_scroll);
+
+    if state.search_selected < state.search_scroll {
+        state.search_scroll = state.search_selected;
+    } else if state.search_selected >= state.search_scroll + visible {
+        state.search_scroll = state.search_selected.saturating_sub(visible.saturating_sub(1));
+    }
+
+    state.search_scroll = state.search_scroll.min(max_scroll);
+}
+
+fn request_expand_path(state: &mut AppState, path: std::path::PathBuf) {
+    if state.expand_in_flight.contains(&path) {
+        return;
+    }
+    let has_children = state
+        .tree
+        .nodes
+        .iter()
+        .find(|n| n.meta.path == path)
+        .map(|n| !n.children.is_empty())
+        .unwrap_or(false);
+    if has_children {
+        return;
+    }
+    state.expand_in_flight.insert(path.clone());
+    state.pending_expand_paths.push_back(path);
+}
+
+fn queue_tree_rebuild(state: &mut AppState, root: std::path::PathBuf) {
+    state.pending_tree_rebuild = Some(root);
+    state.pending_expand_paths.clear();
+    state.expand_in_flight.clear();
+}
+
+/// Retry asynchronous reveal-path work after background scan updates.
+pub fn retry_pending_reveal(state: &mut AppState) {
+    let Some(path) = state.pending_reveal_path.clone() else {
+        return;
+    };
+    reveal_path_in_tree(state, &path);
 }
